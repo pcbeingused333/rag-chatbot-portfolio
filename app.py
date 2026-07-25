@@ -34,6 +34,21 @@ import rag_core
 
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
+SYSTEM_PROMPT = (
+    "Eres un asistente experto que responde preguntas sobre los documentos PDF "
+    "del usuario.\n"
+    "REGLAS:\n"
+    "1. Para CUALQUIER pregunta sobre el contenido de los documentos, usa SIEMPRE "
+    "la herramienta `buscar_en_documentos` antes de responder.\n"
+    "2. Responde de forma DIRECTA y COMPLETA usando la información recuperada. "
+    "Incluye los datos concretos que encuentres (cifras, nombres, fechas, "
+    "artículos, totales). NO te limites a decir que buscaste: da la respuesta.\n"
+    "3. Si la información no está en los documentos, dilo claramente en vez de "
+    "inventar.\n"
+    "4. Responde SIEMPRE en el mismo idioma en que te escribe el usuario.\n"
+    "5. Sé conciso y útil."
+)
+
 
 # ==================== CACHED RESOURCES ====================
 # Cache the heavy objects so the embedding model is loaded ONCE, not on every rerun.
@@ -54,16 +69,18 @@ def load_agent():
 
     @tool
     def buscar_en_documentos(query: str) -> str:
-        """Busca información relevante en los documentos PDF subidos."""
+        """Busca y devuelve fragmentos relevantes de los documentos PDF del usuario.
+        Úsala para responder cualquier pregunta sobre el contenido de los documentos."""
         docs = retriever.invoke(query)
-        # Stash the retrieved docs so the UI can render real citations after the run.
         st.session_state["last_sources"] = docs
+        if not docs:
+            return "No se encontró información relevante en los documentos."
         return "\n\n".join(
             f"[{rag_core.format_citation(d)}]\n{d.page_content}" for d in docs
         )
 
-    llm = ChatGroq(model=LLM_MODEL, temperature=0.3)
-    return create_react_agent(llm, [buscar_en_documentos])
+    llm = ChatGroq(model=LLM_MODEL, temperature=0.2)
+    return create_react_agent(llm, [buscar_en_documentos], prompt=SYSTEM_PROMPT)
 
 
 # ==================== SIDEBAR: UPLOAD + CONTROLS ====================
