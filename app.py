@@ -11,7 +11,7 @@ import tempfile
 
 import streamlit as st
 
-st.set_page_config(page_title="Asistente RAG 2026 — Agente", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="RAG Assistant 2026 — Agent", page_icon="🧠", layout="wide")
 
 # Bridge Streamlit Cloud secrets -> environment variables BEFORE importing modules
 # that read os.getenv at import time (rag_core). Harmless locally: with no
@@ -35,52 +35,52 @@ import rag_core
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
 SYSTEM_PROMPT = (
-    "Eres un asistente experto que responde preguntas sobre los documentos PDF "
-    "del usuario.\n"
-    "REGLAS:\n"
-    "1. Para CUALQUIER pregunta sobre el contenido de los documentos, usa SIEMPRE "
-    "la herramienta `buscar_en_documentos` antes de responder.\n"
-    "2. Responde de forma DIRECTA y COMPLETA usando la información recuperada. "
-    "Incluye los datos concretos que encuentres (cifras, nombres, fechas, "
-    "artículos, totales). NO te limites a decir que buscaste: da la respuesta.\n"
-    "3. Si la información no está en los documentos, dilo claramente en vez de "
-    "inventar.\n"
-    "4. Responde SIEMPRE en el mismo idioma en que te escribe el usuario.\n"
-    "5. Sé conciso y útil."
+    "You are an expert assistant that answers questions about the user's PDF "
+    "documents.\n"
+    "RULES:\n"
+    "1. For ANY question about the content of the documents, ALWAYS use the "
+    "`search_documents` tool before answering.\n"
+    "2. Answer DIRECTLY and COMPLETELY using the retrieved information. Include "
+    "the concrete data you find (figures, names, dates, items, totals). Do NOT "
+    "just say that you searched: give the answer.\n"
+    "3. If the information is not in the documents, say so clearly instead of "
+    "making it up.\n"
+    "4. ALWAYS reply in the same language the user writes in.\n"
+    "5. Be concise and helpful."
 )
 
 
 # ==================== CACHED RESOURCES ====================
 # Cache the heavy objects so the embedding model is loaded ONCE, not on every rerun.
-@st.cache_resource(show_spinner="Cargando modelo de embeddings...")
+@st.cache_resource(show_spinner="Loading embedding model...")
 def load_embeddings():
     return rag_core.get_embeddings()
 
 
-@st.cache_resource(show_spinner="Conectando al vector store...")
+@st.cache_resource(show_spinner="Connecting to the vector store...")
 def load_vectorstore():
     return rag_core.get_vectorstore(load_embeddings())
 
 
-@st.cache_resource(show_spinner="Preparando el agente...")
+@st.cache_resource(show_spinner="Preparing the agent...")
 def load_agent():
     vectorstore = load_vectorstore()
     retriever = vectorstore.as_retriever(search_kwargs={"k": rag_core.RETRIEVAL_K})
 
     @tool
-    def buscar_en_documentos(query: str) -> str:
-        """Busca y devuelve fragmentos relevantes de los documentos PDF del usuario.
-        Úsala para responder cualquier pregunta sobre el contenido de los documentos."""
+    def search_documents(query: str) -> str:
+        """Search and return relevant snippets from the user's PDF documents.
+        Use this to answer any question about the content of the documents."""
         docs = retriever.invoke(query)
         st.session_state["last_sources"] = docs
         if not docs:
-            return "No se encontró información relevante en los documentos."
+            return "No relevant information was found in the documents."
         return "\n\n".join(
             f"[{rag_core.format_citation(d)}]\n{d.page_content}" for d in docs
         )
 
     llm = ChatGroq(model=LLM_MODEL, temperature=0.2)
-    return create_react_agent(llm, [buscar_en_documentos], prompt=SYSTEM_PROMPT)
+    return create_react_agent(llm, [search_documents], prompt=SYSTEM_PROMPT)
 
 
 # ==================== SIDEBAR: UPLOAD + CONTROLS ====================
@@ -88,14 +88,14 @@ with st.sidebar:
     st.title("📚 RAG Agent")
     st.caption("pgvector + Groq + LangGraph")
 
-    st.subheader("📤 Sube documentos")
+    st.subheader("📤 Upload documents")
     uploaded = st.file_uploader(
-        "Arrastra PDFs para añadirlos a la base de conocimiento",
+        "Drag & drop PDFs to add them to the knowledge base",
         type="pdf",
         accept_multiple_files=True,
     )
-    if uploaded and st.button("➕ Añadir a la base", use_container_width=True):
-        with st.spinner("Procesando e indexando..."):
+    if uploaded and st.button("➕ Add to knowledge base", use_container_width=True):
+        with st.spinner("Processing and indexing..."):
             tmp_paths = []
             for f in uploaded:
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
@@ -104,21 +104,21 @@ with st.sidebar:
                 tmp_paths.append(tmp.name)
             try:
                 n = rag_core.ingest_pdf_paths(tmp_paths, load_vectorstore())
-                st.success(f"✅ {len(uploaded)} PDF(s) indexados ({n} fragmentos).")
+                st.success(f"✅ {len(uploaded)} PDF(s) indexed ({n} chunks).")
             finally:
                 for p in tmp_paths:
                     os.unlink(p)
 
     st.divider()
-    if st.button("🗑️ Limpiar historial", use_container_width=True):
+    if st.button("🗑️ Clear history", use_container_width=True):
         st.session_state.chat_history = []
         st.session_state.pop("last_sources", None)
         st.rerun()
 
 
 # ==================== MAIN CHAT ====================
-st.title("🧠 Asistente RAG con Agente Inteligente")
-st.caption("Razona paso a paso y cita la fuente y la página de cada respuesta.")
+st.title("🧠 RAG Assistant with Intelligent Agent")
+st.caption("Reasons step by step and cites the source and page of every answer.")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -127,13 +127,13 @@ for msg in st.session_state.chat_history:
     with st.chat_message("user" if isinstance(msg, HumanMessage) else "assistant"):
         st.markdown(msg.content)
 
-if question := st.chat_input("Pregunta sobre tus documentos..."):
+if question := st.chat_input("Ask about your documents..."):
     st.session_state.chat_history.append(HumanMessage(content=question))
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("El agente está razonando..."):
+        with st.spinner("The agent is reasoning..."):
             st.session_state["last_sources"] = []
             agent = load_agent()
             result = agent.invoke({"messages": st.session_state.chat_history})
@@ -148,7 +148,7 @@ if question := st.chat_input("Pregunta sobre tus documentos..."):
                     if c not in seen:
                         seen.add(c)
                         citations.append((c, d.page_content))
-                with st.expander(f"🔍 Fuentes ({len(citations)})"):
+                with st.expander(f"🔍 Sources ({len(citations)})"):
                     for c, snippet in citations:
                         st.markdown(f"**{c}**")
                         st.caption(snippet[:300] + ("..." if len(snippet) > 300 else ""))
