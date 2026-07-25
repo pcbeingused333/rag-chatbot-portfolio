@@ -10,17 +10,27 @@ import os
 import tempfile
 
 import streamlit as st
+
+st.set_page_config(page_title="Asistente RAG 2026 — Agente", page_icon="🧠", layout="wide")
+
+# Bridge Streamlit Cloud secrets -> environment variables BEFORE importing modules
+# that read os.getenv at import time (rag_core). Harmless locally: with no
+# secrets.toml, st.secrets raises and we simply fall back to the .env file.
+try:
+    for _k, _v in st.secrets.items():
+        os.environ.setdefault(_k, str(_v))
+except Exception:
+    pass
+
 from dotenv import load_dotenv
+load_dotenv()
+
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 import rag_core
-
-load_dotenv()
-
-st.set_page_config(page_title="Asistente RAG 2026 — Agente", page_icon="🧠", layout="wide")
 
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
@@ -115,7 +125,6 @@ if question := st.chat_input("Pregunta sobre tus documentos..."):
 
             sources = st.session_state.get("last_sources", [])
             if sources:
-                # De-duplicate citations while preserving order.
                 seen, citations = set(), []
                 for d in sources:
                     c = rag_core.format_citation(d)
