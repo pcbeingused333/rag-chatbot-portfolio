@@ -1,0 +1,28 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Private user documents — NEVER commit these to a public repo
+data/*.pdf
+data/*.PDF
+data/temp_*
+*.Zone.Identifier
+*:Zone.Identifier
+*.mshield
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+_update.zip
+_to_delete/

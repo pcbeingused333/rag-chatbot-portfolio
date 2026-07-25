@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest
+reportlab   # only needed to regenerate demo/churreria_calderon.pdf

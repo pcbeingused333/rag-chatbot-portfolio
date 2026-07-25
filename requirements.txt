@@ -1,0 +1,12 @@
+langchain==0.3.*
+langchain-groq
+langchain-huggingface
+langchain-postgres
+langchain-community
+langgraph
+pypdf
+python-dotenv
+streamlit
+psycopg[binary]
+sentence-transformers
+tiktoken

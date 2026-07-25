@@ -1,0 +1,32 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: rag_portfolio
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    container_name: rag-chatbot
+    restart: always
+    ports:
+      - "8501:8501"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - POSTGRES_CONNECTION=postgresql://postgres:postgres@postgres:5432/rag_portfolio
+    depends_on:
+      - postgres
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  postgres_data:
