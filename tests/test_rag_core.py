@@ -141,6 +141,60 @@ def test_build_demo_vectorstore_fails_loudly_without_pdfs(monkeypatch, tmp_path)
         assert "DEMO_MODE" in str(e)
 
 
+# ---- Resilience against flaky LLM tool calls ----
+
+class _FakeAgent:
+    """Fails `failures` times with `error`, then returns `answer`."""
+
+    def __init__(self, failures, error, answer="ok"):
+        self.remaining, self.error, self.answer, self.calls = failures, error, answer, 0
+
+    def invoke(self, _payload):
+        self.calls += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise self.error
+        return {"messages": [type("M", (), {"content": self.answer})()]}
+
+
+def test_transient_llm_errors_are_recognised():
+    tool_fail = Exception(
+        "Error code: 400 - {'error': {'message': \"Failed to call a function.\", "
+        "'code': 'tool_use_failed'}}"
+    )
+    assert rag_core.is_transient_llm_error(tool_fail)
+    assert rag_core.is_transient_llm_error(Exception("429 rate limit exceeded"))
+    assert not rag_core.is_transient_llm_error(Exception("Invalid api_key provided"))
+
+
+def test_agent_retry_recovers_from_a_flaky_tool_call():
+    """Groq fails ~50% of tool calls with llama-3.3; one retry must not surface that."""
+    agent = _FakeAgent(1, Exception("400 tool_use_failed"), answer="9.50 CAD")
+    assert rag_core.invoke_agent_with_retry(agent, []) == "9.50 CAD"
+    assert agent.calls == 2
+
+
+def test_agent_retry_gives_up_after_the_attempt_budget():
+    agent = _FakeAgent(99, Exception("400 tool_use_failed"))
+    try:
+        rag_core.invoke_agent_with_retry(agent, [], attempts=3)
+        assert False, "expected the error to propagate"
+    except Exception as e:
+        assert "tool_use_failed" in str(e)
+    assert agent.calls == 3
+
+
+def test_agent_retry_does_not_retry_permanent_errors():
+    """A bad key is not going to fix itself; burning three calls on it is waste."""
+    agent = _FakeAgent(99, Exception("Invalid api_key provided"))
+    try:
+        rag_core.invoke_agent_with_retry(agent, [], attempts=3)
+        assert False, "expected the error to propagate"
+    except Exception as e:
+        assert "api_key" in str(e)
+    assert agent.calls == 1
+
+
 def test_batch_ingestion_is_refused_in_demo_mode(monkeypatch):
     """Demo index is in-memory; writing to pgvector would silently do nothing useful."""
     monkeypatch.setenv("DEMO_MODE", "1")

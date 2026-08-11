@@ -14,7 +14,7 @@ document upload**. Built with **pgvector + LangChain + LangGraph + Groq**.
 - **Real citations** — every answer lists the source file **and page number** it used.
 - **Agent architecture** — a LangGraph ReAct agent decides when to search the knowledge base.
 - **Two runtime modes** — a self-contained demo, or pgvector-backed production (below).
-- **Fast + free LLM** — Groq (Llama-3.3-70B).
+- **Fast + free LLM** — Groq (`gpt-oss-120b`), with retry on transient tool-call failures.
 - **Docker Compose** — one command to run app + database locally.
 
 ## 🔀 Two runtime modes
@@ -29,6 +29,8 @@ app supports both behind a single `DEMO_MODE` environment variable.
 | Knowledge base | `demo/` preloaded at startup            | ingested into Postgres          |
 | External deps  | none                                    | a Postgres instance             |
 | Chunking       | 300 / 50, `k=4`                         | 1000 / 200, `k=7`               |
+| Query language | translated to English before retrieval  | native (embeddings are multilingual) |
+| Peak RSS       | ~580 MB (fits the free 1 GB tier)       | ~2.5 GB                         |
 
 **Why:** a free Streamlit Community Cloud container has 1 GB of RAM, so `bge-m3`
 OOMs it, and a free hosted Postgres pauses when idle — which would leave the public
@@ -45,11 +47,39 @@ and more varied corpora.
 > stop discriminating at all. A test (`test_demo_corpus_splits_into_more_chunks_than_k`)
 > guards against that regressing.
 
+### Keeping the demo multilingual on 1 GB
+
+Dropping `bge-m3` cost multilingual retrieval: `all-MiniLM-L6-v2` is English-only, so
+_"¿Abrís los lunes?"_ retrieved nothing from an English knowledge base even though the
+document says `Monday: closed`. Measured peak RSS for the alternatives:
+
+| Embedding model                          | Peak RSS | EN  | ES  | Fits 1 GB |
+|------------------------------------------|---------:|-----|-----|-----------|
+| `all-MiniLM-L6-v2`                       |   580 MB | 4/4 | 3/4 | ✅        |
+| `multilingual-e5-small`                  |   939 MB | 4/4 | 4/4 | ⚠️ no margin |
+| `paraphrase-multilingual-MiniLM-L12-v2`  | 1 183 MB | 4/4 | 4/4 | ❌        |
+
+No multilingual model fits safely, so the fix is at a different layer: the agent
+translates the **retrieval query** into English while still answering in the user's
+own language. That costs no memory and takes the demo to 4/4 in Spanish (and works
+for French too). The rule is only added to the system prompt when `DEMO_MODE` is on —
+the production path has multilingual embeddings and must query in the original
+language.
+
+### Surviving a flaky tool-calling model
+
+The original default, `llama-3.3-70b-versatile`, emits malformed tool calls often
+enough on Groq to break the agent on **5 of 10** requests (HTTP 400
+`tool_use_failed`). `openai/gpt-oss-120b` handled 10/10 of the same set and is now the
+default. As defence in depth, `invoke_agent_with_retry` retries transient LLM
+failures and leaves permanent ones (a rejected API key) to fail immediately instead of
+burning the whole retry budget.
+
 ## 🧱 Tech Stack
 
 | Layer            | Technology                                  |
 |------------------|---------------------------------------------|
-| Backend / agent  | LangChain, LangGraph, Groq                  |
+| Backend / agent  | LangChain, LangGraph, Groq (gpt-oss-120b)   |
 | Vector DB        | PostgreSQL + pgvector · FAISS (demo)        |
 | Embeddings       | Hugging Face (`bge-m3` · `all-MiniLM-L6-v2`)|
 | Frontend         | Streamlit                                   |

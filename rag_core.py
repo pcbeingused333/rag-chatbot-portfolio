@@ -213,6 +213,47 @@ def ingest_directory(directory: str = "data/", pre_delete: bool = True) -> int:
     return len(chunks)
 
 
+# Groq returns HTTP 400 tool_use_failed when the model emits a malformed tool call.
+# It is a per-request glitch, not a bad question, so the same input usually succeeds
+# on a retry — hence retrying rather than surfacing the error.
+_RETRYABLE_MARKERS = (
+    "tool_use_failed",
+    "failed to call a function",
+    "rate limit",
+    "429",
+    "500",
+    "502",
+    "503",
+    "overloaded",
+    "timeout",
+)
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """Whether an LLM call failed for a reason worth retrying with the same input."""
+    return any(marker in str(exc).lower() for marker in _RETRYABLE_MARKERS)
+
+
+def invoke_agent_with_retry(agent, messages, attempts: int = 3):
+    """
+    Run the agent, retrying transient LLM failures.
+
+    Returns the agent's final message content. Raises the last exception if every
+    attempt fails, or immediately for errors that a retry cannot fix (a bad API key
+    should not be retried three times).
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            result = agent.invoke({"messages": messages})
+            return result["messages"][-1].content
+        except Exception as exc:  # noqa: BLE001 — re-raised below
+            last = exc
+            if not is_transient_llm_error(exc) or attempt == attempts - 1:
+                raise
+    raise last  # unreachable, kept for type-checkers
+
+
 def format_citation(doc: Document) -> str:
     """
     Build a human-readable citation from a retrieved chunk's metadata.
