@@ -4,9 +4,8 @@ A Retrieval-Augmented Generation chatbot that answers questions about your PDF
 documents, with **real source citations (file + page number)** and **real-time
 document upload**. Built with **pgvector + LangChain + LangGraph + Groq**.
 
-> **Live demo:** _coming soon_ — deployed on Streamlit Community Cloud (see [Deploy](#-deploy)).
-
-![Demo screenshot](docs/screenshot.png) <!-- add a real screenshot here -->
+> **Live demo:** _coming soon_ — deployed on Streamlit Community Cloud. See the
+> **Deploy** section below; it needs no database and no paid tier.
 
 ## ✨ Features
 
@@ -14,34 +13,75 @@ document upload**. Built with **pgvector + LangChain + LangGraph + Groq**.
 - **Real-time upload** — drop PDFs in the sidebar and they're indexed on the fly (`st.file_uploader`).
 - **Real citations** — every answer lists the source file **and page number** it used.
 - **Agent architecture** — a LangGraph ReAct agent decides when to search the knowledge base.
-- **Vector search** — PostgreSQL + `pgvector`, `BAAI/bge-m3` multilingual embeddings.
+- **Two runtime modes** — a self-contained demo, or pgvector-backed production (below).
 - **Fast + free LLM** — Groq (Llama-3.3-70B).
 - **Docker Compose** — one command to run app + database locally.
 
+## 🔀 Two runtime modes
+
+The public demo and the production path have genuinely different constraints, so the
+app supports both behind a single `DEMO_MODE` environment variable.
+
+|                | `DEMO_MODE=1` (public demo)             | unset / `0` (production)        |
+|----------------|-----------------------------------------|---------------------------------|
+| Vector store   | FAISS, in memory                        | PostgreSQL + `pgvector`         |
+| Embeddings     | `all-MiniLM-L6-v2` (~90 MB)             | `BAAI/bge-m3` (~2 GB, multilingual) |
+| Knowledge base | `demo/` preloaded at startup            | ingested into Postgres          |
+| External deps  | none                                    | a Postgres instance             |
+| Chunking       | 300 / 50, `k=4`                         | 1000 / 200, `k=7`               |
+
+**Why:** a free Streamlit Community Cloud container has 1 GB of RAM, so `bge-m3`
+OOMs it, and a free hosted Postgres pauses when idle — which would leave the public
+demo dead at exactly the moment someone opens it. Demo mode removes both
+dependencies so the link always works.
+
+The demo chunking values were measured, not guessed. Against four questions with
+known answers, `300/50` puts the correct passage at rank 1 for **4/4**, versus 3/4 at
+`400/80` and 2/4 at `200/30`. Production keeps the larger chunks, which suit longer
+and more varied corpora.
+
+> Note the smaller `k` in demo mode: the sample corpus splits into 13 chunks, so a
+> production `k=7` would return half the document on every query and retrieval would
+> stop discriminating at all. A test (`test_demo_corpus_splits_into_more_chunks_than_k`)
+> guards against that regressing.
+
 ## 🧱 Tech Stack
 
-| Layer            | Technology                          |
-|------------------|-------------------------------------|
-| Backend / agent  | LangChain, LangGraph, Groq          |
-| Vector DB        | PostgreSQL + pgvector               |
-| Embeddings       | Hugging Face (BAAI/bge-m3)          |
-| Frontend         | Streamlit                           |
-| Deployment       | Docker + Docker Compose             |
+| Layer            | Technology                                  |
+|------------------|---------------------------------------------|
+| Backend / agent  | LangChain, LangGraph, Groq                  |
+| Vector DB        | PostgreSQL + pgvector · FAISS (demo)        |
+| Embeddings       | Hugging Face (`bge-m3` · `all-MiniLM-L6-v2`)|
+| Frontend         | Streamlit                                   |
+| Deployment       | Docker + Docker Compose                     |
 
 ## 📂 Project structure
 
 ```
-rag_core.py     Shared logic: embeddings, vector store, ingestion, citations
-app.py          Streamlit UI: chat, real-time upload, citations
-ingest.py       Batch-ingest a folder of PDFs
-demo/           Sample knowledge base (Churrería Calderón) to try it instantly
+rag_core.py     Shared logic: mode resolution, embeddings, vector stores,
+                ingestion, citations — the single place the pipeline is defined
+app.py          Streamlit UI: chat, real-time upload, citations, demo prompts
+ingest.py       Batch-ingest a folder of PDFs into pgvector
+demo/           Sample knowledge base (Churrería Calderón) + the script that builds it
 data/           Your own private PDFs (gitignored — never committed)
-tests/          Unit tests (pytest)
+tests/          Unit tests (pytest) — no Postgres or API key required
+.streamlit/     secrets.toml.example for Streamlit Cloud
 ```
 
 ## 🚀 Quick start
 
-### Option A — Docker (recommended)
+### Option A — Demo mode (fastest, no database)
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env         # add your GROQ_API_KEY
+DEMO_MODE=1 streamlit run app.py
+```
+
+The sample knowledge base is indexed at startup — no ingestion step, no Postgres.
+
+### Option B — Docker (recommended for the production path)
 
 ```bash
 cp .env.example .env         # add your GROQ_API_KEY
@@ -50,7 +90,7 @@ docker compose up --build -d # starts Postgres + the app
 docker compose exec app python ingest.py demo
 ```
 
-### Option B — Local
+### Option C — Local, with your own Postgres
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
@@ -65,14 +105,19 @@ Get a free Groq API key at <https://console.groq.com/keys>.
 ## 🧪 Try the demo
 
 The repo ships with a sample knowledge base — `demo/churreria_calderon.pdf`, the
-"company docs" of a fictional Toronto churrería. After `python ingest.py demo`, ask:
+"company docs" of a sample Toronto churrería.
 
-- _"What are your opening hours on Saturday?"_
-- _"Do you have gluten-free options?"_
-- _"How much notice do you need for catering?"_
+In demo mode it is indexed automatically at startup and the UI offers one-click
+questions, so a first-time visitor sees a working assistant without uploading
+anything. On the production path, load it with `python ingest.py demo` first.
+
+- _"What are the opening hours?"_
+- _"How much is the churros and chocolate combo?"_
+- _"Do you have gluten-free or vegan options?"_
+- _"What do I need to book catering for 80 people?"_
 
 Each answer cites the exact page it came from. Swap in your own PDFs via the sidebar
-uploader or by dropping them in `data/` and running `python ingest.py`.
+uploader, or drop them in `data/` and run `python ingest.py`.
 
 ## ✅ Tests
 
@@ -83,12 +128,28 @@ pytest -q
 
 ## ☁️ Deploy
 
-Runs on any host with a Postgres database that has the `pgvector` extension:
+### Public demo — Streamlit Community Cloud (free, no database)
 
-1. Create a free Postgres (Supabase or Neon) and enable `pgvector`.
-2. Set `POSTGRES_CONNECTION` and `GROQ_API_KEY` as secrets.
-3. Deploy the app to Streamlit Community Cloud (or Railway/Render).
-4. Run the ingestion once against the hosted DB.
+1. Get a free Groq API key at <https://console.groq.com/keys>.
+2. On <https://share.streamlit.io>, create an app from this repo with `app.py` as the
+   main file.
+3. Add two secrets under **Advanced settings → Secrets**:
+   ```toml
+   GROQ_API_KEY = "gsk_..."
+   DEMO_MODE = "1"
+   ```
+4. Optional: add an <https://uptimerobot.com> monitor pinging the URL every ~12 h so
+   the app does not go to sleep between visits.
+
+`app.py` bridges Streamlit secrets into environment variables before importing
+`rag_core`, so the same code path works locally with `.env` and in the cloud.
+
+### Production — any host with pgvector
+
+1. Create a Postgres (Supabase or Neon) and enable the `pgvector` extension.
+2. Set `POSTGRES_CONNECTION` and `GROQ_API_KEY` as secrets. Leave `DEMO_MODE` unset.
+3. Deploy the app (Streamlit Cloud, Railway, Render, or the included Dockerfile).
+4. Run the ingestion once against the hosted DB: `python ingest.py`.
 
 ## 🔒 Note on data
 

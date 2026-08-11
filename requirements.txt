@@ -3,6 +3,7 @@ langchain-groq
 langchain-huggingface
 langchain-postgres
 langchain-community
+faiss-cpu
 langgraph
 pypdf
 python-dotenv

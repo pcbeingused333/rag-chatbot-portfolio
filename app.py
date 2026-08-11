@@ -2,9 +2,13 @@
 app.py — Streamlit UI for the RAG chatbot.
 
 Features:
-  • Real-time PDF upload (ingested into pgvector on the fly)
+  • Real-time PDF upload (ingested into the vector store on the fly)
   • ReAct agent (LangGraph) that reasons before answering
   • Real source citations with page numbers, surfaced under each answer
+
+With DEMO_MODE=1 the app is fully self-contained: a small embedding model, an
+in-memory FAISS index preloaded from demo/, and suggested questions so a first-time
+visitor sees a working assistant without uploading anything.
 """
 import os
 import tempfile
@@ -33,6 +37,15 @@ from langgraph.prebuilt import create_react_agent
 import rag_core
 
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+DEMO_MODE = rag_core.is_demo_mode()
+
+# Shown as one-click buttons in demo mode; all answerable from demo/churreria_calderon.pdf.
+DEMO_QUESTIONS = [
+    "What are the opening hours?",
+    "How much is a churros and chocolate combo?",
+    "Do you have gluten-free or vegan options?",
+    "What do I need to book catering for 80 people?",
+]
 
 SYSTEM_PROMPT = (
     "You are an expert assistant that answers questions about the user's PDF "
@@ -65,7 +78,7 @@ def load_vectorstore():
 @st.cache_resource(show_spinner="Preparing the agent...")
 def load_agent():
     vectorstore = load_vectorstore()
-    retriever = vectorstore.as_retriever(search_kwargs={"k": rag_core.RETRIEVAL_K})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": rag_core.retrieval_k()})
 
     @tool
     def search_documents(query: str) -> str:
@@ -86,9 +99,17 @@ def load_agent():
 # ==================== SIDEBAR: UPLOAD + CONTROLS ====================
 with st.sidebar:
     st.title("📚 RAG Agent")
-    st.caption("pgvector + Groq + LangGraph")
+    st.caption(
+        ("FAISS (in-memory) + Groq + LangGraph" if DEMO_MODE
+         else "pgvector + Groq + LangGraph")
+    )
 
     st.subheader("📤 Upload documents")
+    if DEMO_MODE:
+        st.caption(
+            "Demo mode: uploads are added to an in-memory index and disappear when "
+            "the app restarts. Nothing is stored on a server."
+        )
     uploaded = st.file_uploader(
         "Drag & drop PDFs to add them to the knowledge base",
         type="pdf",
@@ -123,11 +144,26 @@ st.caption("Reasons step by step and cites the source and page of every answer."
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
+question = st.chat_input("Ask about your documents...")
+
+# In demo mode the knowledge base is already loaded, so a first-time visitor should
+# be able to see a real answer without uploading anything.
+if DEMO_MODE and not st.session_state.chat_history:
+    st.info(
+        "**Demo loaded:** the knowledge base of *Churrería Calderón* (a sample "
+        "small-business document) is already indexed. Ask anything below, or try one "
+        "of these. You can also upload your own PDFs in the sidebar."
+    )
+    cols = st.columns(2)
+    for i, suggested in enumerate(DEMO_QUESTIONS):
+        if cols[i % 2].button(suggested, key=f"suggested_{i}", use_container_width=True):
+            question = suggested
+
 for msg in st.session_state.chat_history:
     with st.chat_message("user" if isinstance(msg, HumanMessage) else "assistant"):
         st.markdown(msg.content)
 
-if question := st.chat_input("Ask about your documents..."):
+if question:
     st.session_state.chat_history.append(HumanMessage(content=question))
     with st.chat_message("user"):
         st.markdown(question)
