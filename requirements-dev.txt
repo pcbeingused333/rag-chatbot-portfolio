@@ -1,3 +1,9 @@
 -r requirements.txt
 pytest
 reportlab   # only needed to regenerate demo/churreria_calderon.pdf
+
+# The eval harness (evals/) needs nothing beyond requirements.txt — deliberately.
+# RAGAS was the first choice and every published version, 0.4.3 included, imports
+# langchain_community.chat_models.vertexai, removed in langchain-community 0.4.
+# Installing it would mean pinning the project to a sunset dependency; the judges
+# in evals/judges.py are three prompts instead. See evals/README.md.

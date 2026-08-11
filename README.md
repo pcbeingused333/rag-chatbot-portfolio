@@ -4,8 +4,8 @@ A Retrieval-Augmented Generation chatbot that answers questions about your PDF
 documents, with **real source citations (file + page number)** and **real-time
 document upload**. Built with **pgvector + LangChain + LangGraph + Groq**.
 
-> **Live demo:** _coming soon_ — deployed on Streamlit Community Cloud. See the
-> **Deploy** section below; it needs no database and no paid tier.
+> **Live demo:** <https://rag-chatbot-demo-0.streamlit.app> — no signup, no
+> database, sample knowledge base already loaded.
 
 ## ✨ Features
 
@@ -13,6 +13,8 @@ document upload**. Built with **pgvector + LangChain + LangGraph + Groq**.
 - **Real-time upload** — drop PDFs in the sidebar and they're indexed on the fly (`st.file_uploader`).
 - **Real citations** — every answer lists the source file **and page number** it used.
 - **Agent architecture** — a LangGraph ReAct agent decides when to search the knowledge base.
+- **An evaluation harness** — retrieval, cross-lingual, memory, answer quality and
+  tool-call reliability, all reproducible from the repo ([`evals/`](evals/README.md)).
 - **Two runtime modes** — a self-contained demo, or pgvector-backed production (below).
 - **Fast + free LLM** — Groq (`gpt-oss-120b`), with retry on transient tool-call failures.
 - **Docker Compose** — one command to run app + database locally.
@@ -37,42 +39,93 @@ OOMs it, and a free hosted Postgres pauses when idle — which would leave the p
 demo dead at exactly the moment someone opens it. Demo mode removes both
 dependencies so the link always works.
 
-The demo chunking values were measured, not guessed. Against four questions with
-known answers, `300/50` puts the correct passage at rank 1 for **4/4**, versus 3/4 at
-`400/80` and 2/4 at `200/30`. Production keeps the larger chunks, which suit longer
-and more varied corpora.
+## 📊 Measured, not assumed
 
-> Note the smaller `k` in demo mode: the sample corpus splits into 13 chunks, so a
-> production `k=7` would return half the document on every query and retrieval would
-> stop discriminating at all. A test (`test_demo_corpus_splits_into_more_chunks_than_k`)
-> guards against that regressing.
+Every number below is produced by a command in [`evals/`](evals/README.md), against
+17 questions with known answers over the demo corpus. Reproduce any of them:
 
-### Keeping the demo multilingual on 1 GB
+```bash
+python -m evals.run_eval retrieval --sweep    # no API key needed
+```
 
-Dropping `bge-m3` cost multilingual retrieval: `all-MiniLM-L6-v2` is English-only, so
-_"¿Abrís los lunes?"_ retrieved nothing from an English knowledge base even though the
-document says `Monday: closed`. Measured peak RSS for the alternatives:
+### Chunk size: the configuration was chosen by measurement
 
-| Embedding model                          | Peak RSS | EN  | ES  | Fits 1 GB |
-|------------------------------------------|---------:|-----|-----|-----------|
-| `all-MiniLM-L6-v2`                       |   580 MB | 4/4 | 3/4 | ✅        |
-| `multilingual-e5-small`                  |   939 MB | 4/4 | 4/4 | ⚠️ no margin |
-| `paraphrase-multilingual-MiniLM-L12-v2`  | 1 183 MB | 4/4 | 4/4 | ❌        |
+| Chunking | Chunks | hit@1 | recall@k | MRR |
+|---|---:|---|---|---:|
+| `200/30`, k=4 | 21 | 5/12 (42%) | 8/12 (67%) | 0.52 |
+| **`300/50`, k=4 (shipped)** | **13** | **11/12 (92%)** | **12/12 (100%)** | **0.96** |
+| `400/80`, k=4 | 10 | 8/12 (67%) | 10/12 (83%) | 0.74 |
+| `600/100`, k=4 | 7 | 6/12 (50%) | 12/12 (100%) | 0.72 |
+| `1000/200`, k=7 (production values) | 5 ⚠ ≤ k | 10/12 (83%) | 12/12 (100%) | 0.92 |
 
-No multilingual model fits safely, so the fix is at a different layer: the agent
-translates the **retrieval query** into English while still answering in the user's
-own language. That costs no memory and takes the demo to 4/4 in Spanish (and works
-for French too). The rule is only added to the system prompt when `DEMO_MODE` is on —
-the production path has multilingual embeddings and must query in the original
-language.
+The last row is the bug that started this. With production chunking the corpus
+splits into **5 chunks and `k` is 7**, so every single query returns the entire
+document. recall@k reads 100% because retrieval had stopped filtering anything at
+all — the system answered correctly while doing no retrieval. hit@1 still
+discriminates, which is why the eval reports all three metrics.
+`test_demo_corpus_splits_into_more_chunks_than_k` now guards the invariant.
+
+Smaller chunks are not better either: at `200/30` the price list fragments across
+chunk boundaries and recall drops to 8/12.
+
+### Cross-lingual retrieval: what an English-only index costs
+
+`all-MiniLM-L6-v2` is English-only, so _"¿Abrís los lunes?"_ retrieved nothing from
+an English knowledge base even though the document says `Monday: closed`:
+
+| Query language | hit@1 as asked | hit@1 translated to English |
+|---|---|---|
+| en | 11/12 | 11/12 |
+| es | **0/4** | 3/4 |
+| fr | **0/1** | 1/1 |
+
+Zero. Every Spanish question. The obvious fix is a multilingual embedding model, and
+measured peak RSS says it does not fit (`python -m evals.run_eval memory`):
+
+| Embedding model | Peak RSS | Fits 1 GB |
+|---|---:|---|
+| `all-MiniLM-L6-v2` | 599 MB | ✅ |
+| `multilingual-e5-small` | 988 MB | ⚠️ no margin |
+| `paraphrase-multilingual-MiniLM-L12-v2` | 1232 MB | ❌ OOM |
+
+So the fix moved layers instead: the agent translates the **retrieval query** into
+English while still answering in the user's own language. Zero extra memory. The
+rule is only added to the system prompt under `DEMO_MODE` — production embeddings
+are multilingual and must query in the original language.
+
+### Answer quality, and a refusal the eval caught
+
+`python -m evals.run_eval answers` runs the real agent over all 17 questions and
+judges what it said. It surfaced a defect no unit test could: asked _"Are you on Uber
+Eats or DoorDash?"_ — an ordinary customer question — the agent decided it was
+off-topic and **answered without ever calling the retrieval tool**. Adding a rule
+forbidding a refusal before a search:
+
+| Metric | Before | After |
+|---|---|---|
+| Grounded retrieval (deterministic) | 16/17 | **17/17** |
+| Faithfulness | 0.87 | **0.96** |
+| Answer relevancy | 0.94 | **1.00** |
+| Answer correctness | 0.94 | **1.00** |
+| Context precision | 0.34 | 0.32 |
+
+Context precision barely moves and is not supposed to: with `k=4` and roughly one
+relevant passage per question, ~0.25 is the floor. It measures whether `k` is
+oversized for the corpus, not answer quality.
 
 ### Surviving a flaky tool-calling model
 
-The original default, `llama-3.3-70b-versatile`, emits malformed tool calls often
-enough on Groq to break the agent on **5 of 10** requests (HTTP 400
-`tool_use_failed`). `openai/gpt-oss-120b` handled 10/10 of the same set and is now the
-default. As defence in depth, `invoke_agent_with_retry` retries transient LLM
-failures and leaves permanent ones (a rejected API key) to fail immediately instead of
+The agent has exactly one tool, so a model that emits a malformed tool call cannot
+answer at all. Ten requests per model, **no retry** — the raw per-request rate
+(`python -m evals.run_eval tool-calls`):
+
+| Model | Answered | Malformed tool calls | Failure rate |
+|---|---|---|---:|
+| `openai/gpt-oss-120b` (default) | 10/10 | 0/10 | 0% |
+| `llama-3.3-70b-versatile` (previous default) | 5/10 | 5/10 | **50%** |
+
+`invoke_agent_with_retry` is defence in depth on top of that: it retries transient
+failures and lets permanent ones (a rejected API key) fail immediately instead of
 burning the whole retry budget.
 
 ## 🧱 Tech Stack
@@ -88,15 +141,20 @@ burning the whole retry budget.
 ## 📂 Project structure
 
 ```
-rag_core.py     Shared logic: mode resolution, embeddings, vector stores,
-                ingestion, citations — the single place the pipeline is defined
+rag_core.py     Shared logic: mode resolution, embeddings, vector stores, the
+                agent and its prompt — the single place the pipeline is defined
 app.py          Streamlit UI: chat, real-time upload, citations, demo prompts
 ingest.py       Batch-ingest a folder of PDFs into pgvector
+evals/          Evaluation harness — every number in this README comes from here
 demo/           Sample knowledge base (Churrería Calderón) + the script that builds it
 data/           Your own private PDFs (gitignored — never committed)
 tests/          Unit tests (pytest) — no Postgres or API key required
 .streamlit/     secrets.toml.example for Streamlit Cloud
 ```
+
+The agent lives in `rag_core.build_agent`, not in `app.py`, so the evaluation
+harness scores the same prompt, tool and retriever the user talks to. An eval that
+builds its own copy of the agent measures its own copy.
 
 ## 🚀 Quick start
 
@@ -149,12 +207,17 @@ anything. On the production path, load it with `python ingest.py demo` first.
 Each answer cites the exact page it came from. Swap in your own PDFs via the sidebar
 uploader, or drop them in `data/` and run `python ingest.py`.
 
-## ✅ Tests
+## ✅ Tests and evals
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q
+pytest -q                                  # 61 tests, no Postgres or API key needed
+python -m evals.run_eval retrieval --sweep # scores retrieval, also no API key
 ```
+
+The two answer different questions. Tests check that the code does what it says;
+evals check whether what it says is any good. See [`evals/README.md`](evals/README.md)
+for what each command measures, what it costs, and where the numbers are weak.
 
 ## ☁️ Deploy
 
@@ -188,8 +251,9 @@ be committed. Only the demo knowledge base under `demo/` ships with the repo.
 
 ## 🔮 Roadmap
 
-- Hybrid search (vector + BM25) and reranking (FlashRank)
-- LangSmith tracing
+- Hybrid search (vector + BM25) and reranking (FlashRank) — with the eval harness in
+  place, the point is that any of these can now be shown to help or not
+- Tracing, so a failing answer can be replayed rather than reasoned about
 - Authentication + multi-user collections
 
 ## 📄 License

@@ -29,17 +29,10 @@ except Exception:
 from dotenv import load_dotenv
 load_dotenv()
 
-from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 import rag_core
 
-# llama-3.3-70b-versatile emits malformed tool calls often enough on Groq that the
-# agent errors on roughly half of all questions (measured: 5/10 requests returned
-# HTTP 400 tool_use_failed). gpt-oss-120b handled 10/10 of the same set.
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 DEMO_MODE = rag_core.is_demo_mode()
 
 # Shown as one-click buttons in demo mode; all answerable from demo/churreria_calderon.pdf.
@@ -49,37 +42,6 @@ DEMO_QUESTIONS = [
     "Do you have gluten-free or vegan options?",
     "What do I need to book catering for 80 people?",
 ]
-
-SYSTEM_PROMPT = (
-    "You are an expert assistant that answers questions about the user's PDF "
-    "documents.\n"
-    "RULES:\n"
-    "1. For ANY question about the content of the documents, ALWAYS use the "
-    "`search_documents` tool before answering.\n"
-    "2. Answer DIRECTLY and COMPLETELY using the retrieved information. Include "
-    "the concrete data you find (figures, names, dates, items, totals). Do NOT "
-    "just say that you searched: give the answer.\n"
-    "3. Report figures exactly as the documents write them, including the "
-    "currency, and never convert or restate them in another currency.\n"
-    "4. If the information is not in the documents, say so clearly instead of "
-    "making it up.\n"
-    "5. ALWAYS reply in the same language the user writes in.\n"
-    "6. Be concise and helpful."
-)
-
-# Demo mode indexes with an English-only embedding model (the multilingual ones do
-# not fit the free tier's 1 GB), so a Spanish question would not retrieve anything
-# from the English knowledge base. Translating the *query* while still answering in
-# the user's language costs no extra memory and restored 4/4 Spanish questions.
-CROSS_LINGUAL_RULE = (
-    "\n7. The knowledge base is indexed in ENGLISH and the retriever is not "
-    "multilingual. ALWAYS write the `search_documents` query in ENGLISH, "
-    "translating the user's question when needed, using the wording you would "
-    "expect to find in the document. This does not change rule 5: still reply in "
-    "the user's own language."
-)
-if DEMO_MODE:
-    SYSTEM_PROMPT += CROSS_LINGUAL_RULE
 
 
 # ==================== CACHED RESOURCES ====================
@@ -96,24 +58,14 @@ def load_vectorstore():
 
 @st.cache_resource(show_spinner="Preparing the agent...")
 def load_agent():
-    vectorstore = load_vectorstore()
-    retriever = vectorstore.as_retriever(search_kwargs={"k": rag_core.retrieval_k()})
-
-    @tool
-    def search_documents(query: str) -> str:
-        """Search and return relevant snippets from the user's PDF documents.
-        Use this to answer any question about the content of the documents.
-        In demo mode the index is English-only, so write the query in English."""
-        docs = retriever.invoke(query)
+    # The prompt, the tool and the retriever all live in rag_core, so the evaluation
+    # harness scores this exact agent rather than a lookalike built for testing.
+    def remember_sources(docs):
         st.session_state["last_sources"] = docs
-        if not docs:
-            return "No relevant information was found in the documents."
-        return "\n\n".join(
-            f"[{rag_core.format_citation(d)}]\n{d.page_content}" for d in docs
-        )
 
-    llm = ChatGroq(model=LLM_MODEL, temperature=0.2)
-    return create_react_agent(llm, [search_documents], prompt=SYSTEM_PROMPT)
+    return rag_core.build_agent(
+        vectorstore=load_vectorstore(), on_documents=remember_sources
+    )
 
 
 def ask_agent(agent, messages) -> str:

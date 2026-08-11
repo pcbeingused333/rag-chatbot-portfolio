@@ -254,6 +254,106 @@ def invoke_agent_with_retry(agent, messages, attempts: int = 3):
     raise last  # unreachable, kept for type-checkers
 
 
+# ---- Agent construction ----
+# The agent lives here rather than in app.py so that the evaluation harness runs the
+# same prompt, the same tool and the same retriever the user talks to. An eval that
+# builds its own copy of the agent measures its own copy, not the product.
+
+# llama-3.3-70b-versatile emits malformed tool calls often enough on Groq to break
+# the agent on roughly half of all questions. Reproduce with:
+#     python -m evals.run_eval tool-calls
+DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
+
+BASE_SYSTEM_PROMPT = (
+    "You are an expert assistant that answers questions about the user's PDF "
+    "documents.\n"
+    "RULES:\n"
+    "1. For ANY question about the content of the documents, ALWAYS use the "
+    "`search_documents` tool before answering.\n"
+    "2. Answer DIRECTLY and COMPLETELY using the retrieved information. Include "
+    "the concrete data you find (figures, names, dates, items, totals). Do NOT "
+    "just say that you searched: give the answer.\n"
+    "3. Report figures exactly as the documents write them, including the "
+    "currency, and never convert or restate them in another currency.\n"
+    "4. If the information is not in the documents, say so clearly instead of "
+    "making it up.\n"
+    "5. ALWAYS reply in the same language the user writes in.\n"
+    "6. Be concise and helpful.\n"
+    "7. NEVER refuse a question as off-topic without searching first. If a question "
+    "could plausibly concern the documents — the organisation, its products, hours, "
+    "prices, policies, or anything a customer might reasonably ask — call "
+    "`search_documents` before concluding anything. Only after a search comes back "
+    "empty may you say the information is not in the documents."
+)
+
+# Demo mode indexes with an English-only embedding model (the multilingual ones do
+# not fit the free tier's 1 GB), so a Spanish question retrieves nothing from the
+# English knowledge base. Translating the *query* while still answering in the
+# user's language costs no extra memory. Measured effect, Spanish hit@1: 0/4 as
+# asked, 3/4 translated (python -m evals.run_eval multilingual).
+CROSS_LINGUAL_RULE = (
+    "\n8. The knowledge base is indexed in ENGLISH and the retriever is not "
+    "multilingual. ALWAYS write the `search_documents` query in ENGLISH, "
+    "translating the user's question when needed, using the wording you would "
+    "expect to find in the document. This does not change rule 5: still reply in "
+    "the user's own language."
+)
+
+
+def resolve_llm_model() -> str:
+    """The chat model for the current environment; an explicit env var always wins."""
+    return os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL)
+
+
+def build_system_prompt(demo_mode: Optional[bool] = None) -> str:
+    """System prompt for the agent; the cross-lingual rule is demo-mode only."""
+    if demo_mode is None:
+        demo_mode = is_demo_mode()
+    return BASE_SYSTEM_PROMPT + (CROSS_LINGUAL_RULE if demo_mode else "")
+
+
+def make_search_tool(retriever, on_documents=None):
+    """
+    The agent's one tool: retrieve passages and return them with their citations.
+
+    `on_documents` receives the retrieved chunks, which is how a caller keeps hold
+    of them after the fact — the UI to render sources, the eval to score contexts.
+    """
+    from langchain_core.tools import tool
+
+    @tool
+    def search_documents(query: str) -> str:
+        """Search and return relevant snippets from the user's PDF documents.
+        Use this to answer any question about the content of the documents.
+        In demo mode the index is English-only, so write the query in English."""
+        docs = retriever.invoke(query)
+        if on_documents is not None:
+            on_documents(docs)
+        if not docs:
+            return "No relevant information was found in the documents."
+        return "\n\n".join(f"[{format_citation(d)}]\n{d.page_content}" for d in docs)
+
+    return search_documents
+
+
+def build_agent(vectorstore=None, on_documents=None, llm=None, model: Optional[str] = None,
+                temperature: float = 0.2):
+    """The ReAct agent, wired to the current mode's vector store and model."""
+    from langgraph.prebuilt import create_react_agent
+
+    store = vectorstore if vectorstore is not None else get_vectorstore()
+    retriever = store.as_retriever(search_kwargs={"k": retrieval_k()})
+
+    if llm is None:
+        from langchain_groq import ChatGroq
+
+        llm = ChatGroq(model=model or resolve_llm_model(), temperature=temperature)
+
+    return create_react_agent(
+        llm, [make_search_tool(retriever, on_documents)], prompt=build_system_prompt()
+    )
+
+
 def format_citation(doc: Document) -> str:
     """
     Build a human-readable citation from a retrieved chunk's metadata.
