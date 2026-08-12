@@ -211,13 +211,28 @@ uploader, or drop them in `data/` and run `python ingest.py`.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                                  # 61 tests, no Postgres or API key needed
+pytest -q                                  # 66 tests, no Postgres or API key needed
 python -m evals.run_eval retrieval --sweep # scores retrieval, also no API key
 ```
 
 The two answer different questions. Tests check that the code does what it says;
 evals check whether what it says is any good. See [`evals/README.md`](evals/README.md)
 for what each command measures, what it costs, and where the numbers are weak.
+
+Five of them run the app itself, headlessly, with Streamlit's `AppTest`. "The server
+starts" is not the same as "the script runs": a Streamlit app boots fine and then
+throws on the first browser connection, which is exactly when a visitor opens it.
+
+One of those five is worth naming. It replaces `get_embeddings` with a function that
+raises, then asserts the first render still succeeds — proving no render path touches
+the model. That is the reason `DEMO_MODE` exists: the production embedding model is
+~2 GB against the free tier's 1 GB, and the moment a render reaches for it, the first
+visitor either waits for a download or the container is killed and they get nothing.
+
+They run on every push and pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+Streamlit Community Cloud redeploys from `main` on every push, so there is no deploy
+job — and that is precisely why the suite is not decorative: it is the only thing
+between a bad commit and the public demo.
 
 ## ☁️ Deploy
 

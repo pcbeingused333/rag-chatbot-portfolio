@@ -1,0 +1,47 @@
+name: ci
+
+# Streamlit Community Cloud redeploys from this branch on every push. There is
+# no deploy job here for that reason — and it is also why this suite is not
+# decorative: it is the only thing between a bad commit and the public demo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # sentence-transformers pulls torch, and the default PyPI wheel carries the
+      # CUDA runtime — roughly 2 GB of it, for a CPU-only test job that never
+      # loads a model. Installing the CPU build first satisfies the dependency,
+      # so the line below finds it already present and does not reach for the
+      # large one.
+      - name: CPU-only torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - run: pip install -r requirements-dev.txt
+
+      # No Postgres and no API key: the suite covers chunking, retrieval scoring,
+      # the eval metrics and a headless run of the app itself, none of which call
+      # a model.
+      #
+      # -rs prints the reason for anything skipped. tests/test_app.py guards its
+      # import with importorskip, so a missing streamlit would skip the app smoke
+      # tests rather than fail them — a green run that never checked the thing
+      # being deployed.
+      - run: pytest -q -rs
