@@ -22,10 +22,13 @@ from evals.dataset import questions as load_questions
 from evals.metrics import RetrievalReport, markdown_table
 from evals.retrieval import SWEEP
 
-# The demo ships an English-only model; these are the alternatives that were
-# considered for multilingual support and rejected on memory grounds.
+# The demo ships an English-only model. The first two are the English candidates the
+# corpus change forced a choice between; the last two are the multilingual options,
+# kept in the comparison because they are what the query-translation rule exists to
+# avoid paying for.
 EMBEDDING_CANDIDATES = [
     "sentence-transformers/all-MiniLM-L6-v2",
+    "BAAI/bge-small-en-v1.5",
     "intfloat/multilingual-e5-small",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 ]
@@ -47,7 +50,7 @@ def cmd_retrieval(args) -> int:
     questions = load_questions(args.langs)
     configs = SWEEP if args.sweep else [retrieval_mod.DEMO_DEFAULT]
 
-    print(f"Corpus: {', '.join(p.split('/')[-1] for p in _demo_paths())}")
+    print(f"Corpus: {_corpus_label()}")
     print(f"Questions: {len(questions)} ({', '.join(sorted({q.lang for q in questions}))})")
     print(f"Retrieval query: {'translated to English' if args.translate else 'as asked'}\n")
 
@@ -91,7 +94,12 @@ def cmd_multilingual(args) -> int:
     config = retrieval_mod.DEMO_DEFAULT
     index, chunk_count = retrieval_mod.build_index(docs, config, embeddings)
 
-    print(f"Embedding model: {args.embedding_model or 'demo default (all-MiniLM-L6-v2)'}")
+    import rag_core
+
+    print(
+        "Embedding model: "
+        f"{args.embedding_model or f'demo default ({rag_core.DEMO_EMBEDDING_MODEL})'}"
+    )
     print(f"Index: {chunk_count} chunks at {config.label}\n")
 
     rows = []
@@ -182,6 +190,18 @@ def cmd_answers(args) -> int:
     )
 
 
+def cmd_abstention(args) -> int:
+    from evals.abstention import run as run_abstention
+
+    return run_abstention(
+        langs=args.langs,
+        limit=args.limit,
+        json_path=args.json,
+        model=args.model,
+        judge_model=args.judge_model,
+    )
+
+
 def cmd_tool_calls(args) -> int:
     from evals.tool_calls import run as run_tool_calls
 
@@ -195,10 +215,14 @@ def cmd_tool_calls(args) -> int:
 # ---- helpers ----
 
 
-def _demo_paths() -> Sequence[str]:
+def _corpus_label() -> str:
     import rag_core
 
-    return rag_core.demo_pdf_paths()
+    docs = rag_core.load_legal_corpus()
+    instrument = docs[0].metadata.get("instrument", "corpus") if docs else "corpus"
+    headings = "with headings" if rag_core.embed_headings() else "provision text only"
+    articles = len({d.metadata.get("article") for d in docs})
+    return f"{instrument} — {len(docs)} provisions from {articles} articles ({headings})"
 
 
 def _embeddings(model_name: Optional[str]):
@@ -275,6 +299,18 @@ def build_parser() -> argparse.ArgumentParser:
     answers.add_argument("--model", help="override the LLM under test")
     answers.add_argument("--judge-model", help="override the judging LLM")
     answers.set_defaults(func=cmd_answers)
+
+    abstention = add_common(
+        subparsers.add_parser(
+            "abstention",
+            help="does it decline what the corpus cannot answer (needs GROQ_API_KEY)",
+        )
+    )
+    abstention.add_argument("--langs", nargs="*", help="restrict to en/es/fr")
+    abstention.add_argument("--limit", type=int, help="only the first N questions")
+    abstention.add_argument("--model", help="override the LLM under test")
+    abstention.add_argument("--judge-model", help="override the judging LLM")
+    abstention.set_defaults(func=cmd_abstention)
 
     tool_calls = add_common(
         subparsers.add_parser(

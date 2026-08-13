@@ -8,7 +8,7 @@ here — the substring matching, the aggregates, the judge parsing.
 import pytest
 
 from evals import judges
-from evals.dataset import QUESTIONS, questions
+from evals.dataset import QUESTIONS, UNANSWERABLE, questions
 from evals.metrics import (
     QuestionResult,
     RetrievalReport,
@@ -109,9 +109,9 @@ def test_question_ids_are_unique():
     assert len(ids) == len(set(ids))
 
 
-def test_every_question_carries_a_passage_marker_and_a_reference():
+def test_every_question_carries_an_expected_provision_and_a_reference():
     for q in QUESTIONS:
-        assert q.expect, f"{q.id} has no expected passage"
+        assert q.expect_citations, f"{q.id} has no expected provision"
         assert q.reference, f"{q.id} has no reference answer"
 
 
@@ -140,24 +140,40 @@ def test_unknown_language_fails_loudly_instead_of_returning_nothing():
         questions(["de"])
 
 
-def test_every_expected_passage_actually_appears_in_the_demo_corpus():
+def test_every_expected_provision_exists_in_the_corpus():
     """
-    Guards the dataset against the document changing underneath it.
+    Guards the dataset against the corpus being rebuilt underneath it.
 
-    If demo/churreria_calderon.pdf is regenerated with different wording, every
-    question silently becomes unanswerable and the eval reports 0/17 as though the
-    retriever broke.
+    If build_gdpr_corpus.py changes how it numbers provisions, every question
+    silently becomes unanswerable and the eval reports 0/25 as though the retriever
+    broke. A citation that does not resolve is a dataset bug, not a retrieval score.
     """
-    from langchain_community.document_loaders import PyPDFLoader
-
     import rag_core
 
-    corpus = " ".join(
-        doc.page_content for path in rag_core.demo_pdf_paths()
-        for doc in PyPDFLoader(path).load()
-    )
+    available = {
+        doc.metadata["citation"] for doc in rag_core.load_legal_corpus()
+    }
     for q in QUESTIONS:
-        assert chunk_contains(corpus, q.expect), f"{q.id}: no expected passage in the corpus"
+        for citation in q.expect_citations:
+            assert citation in available, f"{q.id}: {citation} is not in the corpus"
+
+
+def test_unanswerable_questions_name_only_real_adjacent_provisions():
+    """
+    The adjacent provisions are the ones the retriever is *expected* to return.
+
+    They document why each question is a near miss rather than an unrelated one, so
+    a typo there would quietly misdescribe what the abstention eval is testing.
+    """
+    import rag_core
+
+    available = {
+        doc.metadata["citation"] for doc in rag_core.load_legal_corpus()
+    }
+    for q in UNANSWERABLE:
+        assert q.why, f"{q.id} does not say why it is unanswerable"
+        for citation in q.adjacent:
+            assert citation in available, f"{q.id}: {citation} is not in the corpus"
 
 
 # ---- judge plumbing ----

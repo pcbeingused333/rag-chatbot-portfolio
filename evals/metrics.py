@@ -50,6 +50,22 @@ def hit_rank(chunk_texts: Sequence[str], expect: Iterable[str]) -> Optional[int]
     return None
 
 
+def provision_rank(cited: Sequence[Optional[str]], expected: Iterable[str]) -> Optional[int]:
+    """
+    1-indexed position of the first chunk drawn from one of the expected provisions.
+
+    The counterpart of `hit_rank` for a structured corpus, and the stricter of the
+    two. `hit_rank` asks whether the retrieved text contains the right words, which
+    a neighbouring provision quoting the same phrase can satisfy; this asks whether
+    the chunk came from the right authority, which nothing else can.
+    """
+    wanted = {normalize(citation) for citation in expected}
+    for position, citation in enumerate(cited, start=1):
+        if citation and normalize(citation) in wanted:
+            return position
+    return None
+
+
 @dataclass(frozen=True)
 class QuestionResult:
     """One question's outcome under one configuration."""

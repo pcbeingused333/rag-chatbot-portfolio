@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 import rag_core
 from evals.dataset import Question, questions as load_questions
 from evals.judges import QualityScores, judge, mean
-from evals.metrics import chunk_contains
+from evals.metrics import provision_rank
 
 # A separate, larger judge model: having the model under test grade its own homework
 # is the one shortcut that invalidates the whole exercise.
@@ -95,7 +95,13 @@ def run(
         captured.clear()
         result = _answer(agent, question)
         contexts = [doc.page_content for doc in captured]
-        grounded = any(chunk_contains(text, question.expect) for text in contexts)
+        grounded = (
+            provision_rank(
+                [rag_core.cited_provision(doc) for doc in captured],
+                question.expect_citations,
+            )
+            is not None
+        )
 
         if result["error"]:
             scores = QualityScores(None, None, None, None, note=result["error"][:200])

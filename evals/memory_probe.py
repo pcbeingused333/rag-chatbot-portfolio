@@ -6,9 +6,14 @@ goes out of scope, so measuring several models inside one process reports the hi
 water mark of everything loaded so far. Each model therefore gets its own process,
 and the parent reads the number back off stdout.
 
+With --with-index the probe also builds the demo FAISS index over the whole corpus,
+which is what the container actually holds: the model on its own understates the
+answer to the only question that matters, which is whether the app survives in 1 GB.
+
 Usage (normally invoked by `python -m evals.run_eval memory`):
 
     python -m evals.memory_probe sentence-transformers/all-MiniLM-L6-v2
+    python -m evals.memory_probe BAAI/bge-small-en-v1.5 --with-index
 """
 import json
 import resource
@@ -21,11 +26,15 @@ def peak_rss_mb() -> float:
 
 
 def main(argv) -> int:
-    if len(argv) != 2:
-        print("usage: python -m evals.memory_probe <embedding-model>", file=sys.stderr)
+    if not 2 <= len(argv) <= 3:
+        print(
+            "usage: python -m evals.memory_probe <embedding-model> [--with-index]",
+            file=sys.stderr,
+        )
         return 2
 
     model_name = argv[1]
+    with_index = len(argv) == 3 and argv[2] == "--with-index"
     baseline = peak_rss_mb()
 
     from langchain_huggingface import HuggingFaceEmbeddings
@@ -33,12 +42,18 @@ def main(argv) -> int:
     embeddings = HuggingFaceEmbeddings(model_name=model_name)
     # Embed once: the model is lazy in places, and an unused model understates the
     # memory a request actually costs.
-    embeddings.embed_query("How much is the churros and chocolate combo?")
+    embeddings.embed_query("How quickly must a personal data breach be reported?")
+
+    if with_index:
+        import rag_core
+
+        rag_core.build_demo_vectorstore(embeddings)
 
     print(
         json.dumps(
             {
                 "model": model_name,
+                "with_index": with_index,
                 "peak_rss_mb": round(peak_rss_mb(), 1),
                 "baseline_rss_mb": round(baseline, 1),
             }

@@ -13,7 +13,7 @@ from typing import Dict, Iterator, List, Optional, Sequence
 
 import rag_core
 from evals.dataset import Question
-from evals.metrics import QuestionResult, RetrievalReport, hit_rank
+from evals.metrics import QuestionResult, RetrievalReport, provision_rank
 
 
 @dataclass(frozen=True)
@@ -29,15 +29,18 @@ class ChunkingConfig:
         return f"`{self.chunk_size}/{self.chunk_overlap}`, k={self.k}"
 
 
-# The demo default sits in the middle; the neighbours are what it was chosen over.
-# 1000/200/k=7 is the production configuration, included to show what happens when
-# it is pointed at a corpus this small.
+# The corpus arrives pre-split into 414 provisions with a median length of ~370
+# characters, so the question this sweep answers is how much of a provision the
+# splitter is allowed to cut in half. 300 was measured as optimal for the previous
+# corpus — a two-page business document — and is kept as the baseline it has to beat,
+# because "the setting we already had" is the honest thing to compare against.
 SWEEP: List[ChunkingConfig] = [
-    ChunkingConfig(200, 30, 4),
     ChunkingConfig(300, 50, 4),
-    ChunkingConfig(400, 80, 4),
     ChunkingConfig(600, 100, 4),
-    ChunkingConfig(1000, 200, 7),
+    ChunkingConfig(1000, 150, 4),
+    ChunkingConfig(1500, 200, 4),
+    ChunkingConfig(1500, 200, 8),
+    ChunkingConfig(2000, 200, 8),
 ]
 
 DEMO_DEFAULT = ChunkingConfig(
@@ -66,18 +69,8 @@ def chunking(config: ChunkingConfig) -> Iterator[None]:
 
 
 def load_demo_documents() -> List:
-    """The demo corpus, loaded once and reused across every configuration."""
-    from langchain_community.document_loaders import PyPDFLoader
-
-    paths = rag_core.demo_pdf_paths()
-    if not paths:
-        raise RuntimeError(
-            f"No PDF found in {rag_core.DEMO_DIR}. Run: python demo/make_demo_pdf.py"
-        )
-    docs = []
-    for path in paths:
-        docs.extend(PyPDFLoader(path).load())
-    return docs
+    """The legal corpus, loaded once and reused across every configuration."""
+    return rag_core.load_legal_corpus()
 
 
 def build_index(docs: Sequence, config: ChunkingConfig, embeddings):
@@ -106,7 +99,10 @@ def evaluate(
                 id=question.id,
                 lang=question.lang,
                 query=query,
-                rank=hit_rank([doc.page_content for doc in retrieved], question.expect),
+                rank=provision_rank(
+                    [rag_core.cited_provision(doc) for doc in retrieved],
+                    question.expect_citations,
+                ),
                 citations=[rag_core.format_citation(doc) for doc in retrieved],
             )
         )
