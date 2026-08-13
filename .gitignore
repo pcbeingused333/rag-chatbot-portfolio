@@ -12,6 +12,11 @@ data/temp_*
 *:Zone.Identifier
 *.mshield
 
+# Cached EUR-Lex download used by --check. The parsed corpus (corpus/gdpr_en.jsonl)
+# IS committed on purpose: Streamlit Community Cloud deploys the repo as-is and never
+# runs the builder, so an uncommitted corpus means the demo boots with nothing indexed.
+corpus/.gdpr_en.html
+
 # Python
 __pycache__/
 *.py[cod]

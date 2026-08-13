@@ -32,21 +32,50 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "pdf_documents")
 
 # Demo uses a ~90 MB model; production uses a ~2 GB multilingual one that would
 # OOM a free-tier container.
-DEMO_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# bge-small-en-v1.5 replaced all-MiniLM-L6-v2 when the corpus became the GDPR. On a
+# two-page business document the two were indistinguishable; over 414 provisions, where
+# the competing passages are sibling paragraphs of the same article, MiniLM ranks the
+# right provision first for 9 of 20 questions and bge-small for 12. It costs 42 MB more
+# (python -m evals.run_eval memory) and has a 512-token window rather than 256.
+DEMO_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 PROD_EMBEDDING_MODEL = "BAAI/bge-m3"
 
-# The demo corpus is a single short, section-structured document. With
-# production-sized chunks it splits into fewer pieces than RETRIEVAL_K, so every
-# query retrieves the whole document and retrieval stops discriminating — the demo
-# would look like it works while proving nothing.
+# Measured, not guessed (python -m evals.run_eval retrieval --sweep).
 #
-# These values were measured, not guessed: against four questions with known
-# answers, 300/50/k=4 puts the correct passage at rank 1 for 4/4, versus 3/4 at
-# 400/80 and 2/4 at 200/30 (smaller chunks fragment the price list).
-DEMO_CHUNK_SIZE, DEMO_CHUNK_OVERLAP, DEMO_RETRIEVAL_K = 300, 50, 4
+# 1500 is large enough that the splitter almost never cuts a provision in half: the
+# corpus holds 414 provisions and this produces 431 chunks, so the great majority are
+# one provision exactly. That matters more here than the raw score — a chunk that
+# straddles Article 33(1) and 33(2) is attributed to one of them, and a citation that
+# points at the wrong paragraph is the failure this whole design exists to prevent.
+#
+# k=4 rather than 8 because with the article heading embedded (see embed_headings)
+# k=8 buys nothing: both reach recall@k 17/20 and MRR 0.74. Half the retrieved
+# context per request is not free — k=8 at this chunk size was large enough to
+# exhaust Groq's per-minute token budget mid-run, which is the 413 handled in
+# invoke_agent_with_retry.
+#
+# 300/50 was the measured optimum for the previous corpus, a two-page business
+# document. It scores 65%/80% on this one. The setting did not go stale; the corpus
+# changed, and this is what re-running the sweep is for.
+DEMO_CHUNK_SIZE, DEMO_CHUNK_OVERLAP, DEMO_RETRIEVAL_K = 1500, 200, 4
 PROD_CHUNK_SIZE, PROD_CHUNK_OVERLAP, PROD_RETRIEVAL_K = 1000, 200, 7
 
 DEMO_DIR = os.getenv("DEMO_DIR", os.path.join(HERE, "demo"))
+
+# The demo knowledge base is the GDPR, built structurally by corpus/build_gdpr_corpus.py
+# straight from the EUR-Lex text. It is JSONL rather than PDF because the citation unit
+# of a regulation is the provision, not the page: nobody looks up page 14 of the GDPR,
+# and which page a provision lands on is an artefact of typesetting. Uploaded PDFs still
+# work and still cite pages — that path is unchanged.
+CORPUS_DIR = os.getenv("CORPUS_DIR", os.path.join(HERE, "corpus"))
+LEGAL_CORPUS_PATH = os.path.join(CORPUS_DIR, "gdpr_en.jsonl")
+
+# Metadata keys carried from the corpus into every chunk, so a retrieved fragment
+# still knows which provision it came from.
+PROVISION_KEYS = (
+    "citation", "article", "paragraph", "article_title",
+    "chapter", "chapter_title", "instrument", "source_url",
+)
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -117,26 +146,67 @@ def demo_pdf_paths() -> List[str]:
     )
 
 
+def embed_headings() -> bool:
+    """
+    Whether the citation and article title are part of the embedded text.
+
+    On by default, but only because it was measured twice. The heading is identical
+    across every paragraph of an article, so the obvious worry is that it drags
+    sibling provisions together exactly where they most need telling apart — and
+    under all-MiniLM-L6-v2 that is what happens: dropping the heading took hit@1
+    from 4/20 to 8/20. Under bge-small-en-v1.5, the model that actually ships, it
+    reverses: the heading helps in four of the five sweep configurations, and at the
+    shipped one it is 13/20 with against 12/20 without.
+
+    The lesson is in the reversal. The first result was true of a component that is
+    no longer in the system, and carrying it forward would have shipped the worse
+    setting on the strength of a real measurement.
+    """
+    return os.getenv("EMBED_HEADINGS", "1").strip().lower() in _TRUTHY
+
+
+def load_legal_corpus(path: Optional[str] = None) -> List[Document]:
+    """
+    The GDPR knowledge base: one Document per provision, carrying its citation.
+
+    Each record is already a self-contained provision, so this does no splitting —
+    that is `split_documents`' job, and the point of the sweep in `evals/` is to
+    find a chunk size that leaves most provisions whole.
+    """
+    import json
+
+    corpus_path = path or LEGAL_CORPUS_PATH
+    with_headings = embed_headings()
+    if not os.path.exists(corpus_path):
+        raise RuntimeError(
+            f"The legal corpus is missing at {corpus_path}. "
+            "Run: python corpus/build_gdpr_corpus.py"
+        )
+
+    docs: List[Document] = []
+    with open(corpus_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            metadata = {key: record[key] for key in PROVISION_KEYS if key in record}
+            metadata["source"] = record.get("instrument_long", record.get("instrument"))
+            content = record["text"] if with_headings else record.get("body", record["text"])
+            docs.append(Document(page_content=content, metadata=metadata))
+    return docs
+
+
 def build_demo_vectorstore(embeddings=None):
     """
-    In-memory FAISS index seeded with the demo PDFs — no external database.
+    In-memory FAISS index over the legal corpus — no external database.
 
     Rebuilt on every cold start, which is fine: the corpus is small and this is
     what keeps the public demo alive without a Postgres instance that can pause.
     """
-    paths = demo_pdf_paths()
-    if not paths:
-        raise RuntimeError(
-            f"DEMO_MODE is on but no PDF was found in {DEMO_DIR}. "
-            "Run: python demo/make_demo_pdf.py"
-        )
-
-    from langchain_community.document_loaders import PyPDFLoader
     from langchain_community.vectorstores import FAISS
 
-    docs: List[Document] = []
-    for path in paths:
-        docs.extend(PyPDFLoader(path).load())
+    docs = load_legal_corpus()
     return FAISS.from_documents(split_documents(docs), embeddings or get_embeddings())
 
 
@@ -179,6 +249,36 @@ def ingest_pdf_paths(paths: List[str], vectorstore=None) -> int:
         return 0
     chunks = split_documents(all_docs)
     store.add_documents(chunks)
+    return len(chunks)
+
+
+def ingest_legal_corpus(pre_delete: bool = True) -> int:
+    """
+    Load the structured legal corpus into pgvector (the production path).
+
+    Demo mode rebuilds the index in memory on every cold start, so it never needs
+    this. Production does: without it the only way to get the Regulation into
+    Postgres would be through the PDF loader, which is exactly the round-trip that
+    would throw away the article structure the citations depend on.
+    """
+    if is_demo_mode():
+        raise RuntimeError(
+            "Batch ingestion writes to pgvector and is not available in DEMO_MODE "
+            "(the demo index is in-memory and rebuilt on startup). "
+            "Unset DEMO_MODE to ingest into Postgres."
+        )
+
+    from langchain_postgres.vectorstores import PGVector
+
+    chunks = split_documents(load_legal_corpus())
+    PGVector.from_documents(
+        documents=chunks,
+        embedding=get_embeddings(),
+        collection_name=COLLECTION_NAME,
+        connection=get_connection_string(),
+        use_jsonb=True,
+        pre_delete_collection=pre_delete,
+    )
     return len(chunks)
 
 
@@ -226,7 +326,27 @@ _RETRYABLE_MARKERS = (
     "503",
     "overloaded",
     "timeout",
+    # Groq reports a tokens-per-minute exhaustion as 413 "Request too large", which
+    # reads like an oversized payload and is really a rate limit with a clock on it.
+    # The abstention eval surfaced this: raising k to 8 made each request big enough
+    # to trip the per-minute budget, and because 413 was not on this list the run
+    # died on the first question instead of waiting a beat. It is only retryable
+    # with a delay, which is why _backoff_seconds exists.
+    "413",
+    "request too large",
+    "tokens per minute",
 )
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """
+    Delay before retry number `attempt` (0-indexed).
+
+    A malformed tool call is worth retrying instantly. A per-minute token budget is
+    not: retrying it immediately just spends another request to be told the same
+    thing, so the wait has to be long enough for the window to move.
+    """
+    return min(2.0 * (2 ** attempt), 30.0)
 
 
 def is_transient_llm_error(exc: BaseException) -> bool:
@@ -234,14 +354,29 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _RETRYABLE_MARKERS)
 
 
-def invoke_agent_with_retry(agent, messages, attempts: int = 3):
+def is_rate_limited(exc: BaseException) -> bool:
+    """Whether a failure is a budget that refills with time rather than a glitch."""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("rate limit", "429", "413", "request too large", "tokens per minute")
+    )
+
+
+def invoke_agent_with_retry(agent, messages, attempts: int = 3, sleep=None):
     """
     Run the agent, retrying transient LLM failures.
 
     Returns the agent's final message content. Raises the last exception if every
     attempt fails, or immediately for errors that a retry cannot fix (a bad API key
     should not be retried three times).
+
+    `sleep` is injectable so the tests can exercise the backoff without waiting for
+    it. Only rate-limit failures wait; a malformed tool call retries immediately.
     """
+    import time
+
+    sleep = sleep or time.sleep
     last: Optional[BaseException] = None
     for attempt in range(attempts):
         try:
@@ -251,6 +386,8 @@ def invoke_agent_with_retry(agent, messages, attempts: int = 3):
             last = exc
             if not is_transient_llm_error(exc) or attempt == attempts - 1:
                 raise
+            if is_rate_limited(exc):
+                sleep(_backoff_seconds(attempt))
     raise last  # unreachable, kept for type-checkers
 
 
@@ -265,25 +402,36 @@ def invoke_agent_with_retry(agent, messages, attempts: int = 3):
 DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 
 BASE_SYSTEM_PROMPT = (
-    "You are an expert assistant that answers questions about the user's PDF "
-    "documents.\n"
+    "You are a research assistant over a corpus of legal and regulatory source "
+    "texts. You help the user find what the instruments actually say, and you make "
+    "every statement checkable against the provision it came from.\n"
     "RULES:\n"
-    "1. For ANY question about the content of the documents, ALWAYS use the "
+    "1. For ANY question about the content of the corpus, ALWAYS use the "
     "`search_documents` tool before answering.\n"
-    "2. Answer DIRECTLY and COMPLETELY using the retrieved information. Include "
-    "the concrete data you find (figures, names, dates, items, totals). Do NOT "
-    "just say that you searched: give the answer.\n"
-    "3. Report figures exactly as the documents write them, including the "
-    "currency, and never convert or restate them in another currency.\n"
-    "4. If the information is not in the documents, say so clearly instead of "
-    "making it up.\n"
-    "5. ALWAYS reply in the same language the user writes in.\n"
-    "6. Be concise and helpful.\n"
-    "7. NEVER refuse a question as off-topic without searching first. If a question "
-    "could plausibly concern the documents — the organisation, its products, hours, "
-    "prices, policies, or anything a customer might reasonably ask — call "
-    "`search_documents` before concluding anything. Only after a search comes back "
-    "empty may you say the information is not in the documents."
+    "2. Answer DIRECTLY and COMPLETELY from the retrieved text. Give the substance "
+    "— the obligation, the deadline, the threshold, the condition — not a summary "
+    "of the fact that you searched.\n"
+    "3. CITE THE PROVISION for every statement you make, in the form the retrieved "
+    "passage gives it (for example 'Art. 33(1)'). A statement of law without its "
+    "citation is unusable: the reader cannot verify it. Never cite a provision that "
+    "was not in the retrieved passages, and never adjust a citation to make it look "
+    "more precise than the passage supports.\n"
+    "4. Quote thresholds, deadlines, figures and conditions exactly as written "
+    "(‘72 hours’, ‘one month’, ‘EUR 20 000 000’, ‘4 % of the total worldwide annual "
+    "turnover’). Do not round them, convert currencies, or restate them.\n"
+    "5. Answer ONLY from the retrieved passages. You may know things about this "
+    "area of law from training; that knowledge is not a source here and must not "
+    "appear in an answer. If the search does not return a provision that answers "
+    "the question, say plainly that the corpus does not cover it. An unsupported "
+    "answer is a worse outcome than no answer.\n"
+    "6. Distinguish what the text says from what it would mean for the user. You "
+    "describe provisions; you do not advise on a specific situation, and you say so "
+    "when a question asks you to.\n"
+    "7. ALWAYS reply in the same language the user writes in.\n"
+    "8. NEVER refuse a question as off-topic without searching first. If it could "
+    "plausibly concern the corpus — an obligation, a right, a definition, a "
+    "procedure, a penalty, a role — call `search_documents` before concluding "
+    "anything. Only after a search comes back empty may you say so."
 )
 
 # Demo mode indexes with an English-only embedding model (the multilingual ones do
@@ -292,11 +440,11 @@ BASE_SYSTEM_PROMPT = (
 # user's language costs no extra memory. Measured effect, Spanish hit@1: 0/4 as
 # asked, 3/4 translated (python -m evals.run_eval multilingual).
 CROSS_LINGUAL_RULE = (
-    "\n8. The knowledge base is indexed in ENGLISH and the retriever is not "
-    "multilingual. ALWAYS write the `search_documents` query in ENGLISH, "
-    "translating the user's question when needed, using the wording you would "
-    "expect to find in the document. This does not change rule 5: still reply in "
-    "the user's own language."
+    "\n9. The corpus is indexed in ENGLISH and the retriever is not multilingual. "
+    "ALWAYS write the `search_documents` query in ENGLISH, translating the user's "
+    "question when needed, using the wording you would expect to find in the "
+    "instrument itself. This does not change rule 7: still reply in the user's own "
+    "language."
 )
 
 
@@ -356,13 +504,36 @@ def build_agent(vectorstore=None, on_documents=None, llm=None, model: Optional[s
 
 def format_citation(doc: Document) -> str:
     """
-    Build a human-readable citation from a retrieved chunk's metadata.
+    Build a citation from a retrieved chunk's metadata.
 
-    PyPDFLoader stores the file path in `source` and a 0-indexed `page`;
-    we surface the file name and a 1-indexed page number.
+    Two shapes, because the two corpora have different citable units:
+
+    - A provision from the legal corpus cites the way the instrument is actually
+      cited — "GDPR Art. 17(1) — Right to erasure". A page number would be useless
+      here: it is a property of the rendering, not of the law, and a reader sent to
+      "page 14" cannot confirm anything.
+    - An uploaded PDF has no structure to cite, so it falls back to file and
+      1-indexed page (PyPDFLoader stores the path in `source` and a 0-indexed `page`).
     """
+    citation = doc.metadata.get("citation")
+    if citation:
+        title = doc.metadata.get("article_title")
+        return f"{citation} — {title}" if title else citation
+
     source = os.path.basename(doc.metadata.get("source", "unknown"))
     page = doc.metadata.get("page")
     if page is not None:
         return f"{source} — p. {int(page) + 1}"
     return source
+
+
+def cited_provision(doc: Document) -> Optional[str]:
+    """
+    The bare provision reference for a chunk ("GDPR Art. 17(1)"), or None.
+
+    This is what the evaluation scores against. Ground truth held as structural
+    metadata rather than as a substring of the text removes a whole class of false
+    misses: a chunk boundary can split the wording of a provision, but it cannot
+    split the provision the chunk came from.
+    """
+    return doc.metadata.get("citation")

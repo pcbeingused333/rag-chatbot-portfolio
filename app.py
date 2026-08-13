@@ -4,11 +4,12 @@ app.py — Streamlit UI for the RAG chatbot.
 Features:
   • Real-time PDF upload (ingested into the vector store on the fly)
   • ReAct agent (LangGraph) that reasons before answering
-  • Real source citations with page numbers, surfaced under each answer
+  • Citations surfaced under each answer: the provision for corpus text
+    (Art. 33(1)), the file and page for an uploaded PDF
 
 With DEMO_MODE=1 the app is fully self-contained: a small embedding model, an
-in-memory FAISS index preloaded from demo/, and suggested questions so a first-time
-visitor sees a working assistant without uploading anything.
+in-memory FAISS index preloaded from corpus/gdpr_en.jsonl, and suggested questions so
+a first-time visitor sees a working assistant without uploading anything.
 """
 import os
 import tempfile
@@ -35,12 +36,14 @@ import rag_core
 
 DEMO_MODE = rag_core.is_demo_mode()
 
-# Shown as one-click buttons in demo mode; all answerable from demo/churreria_calderon.pdf.
+# Shown as one-click buttons in demo mode. The first three are answerable from the
+# corpus; the fourth deliberately is not, because the behaviour worth showing a
+# first-time visitor is the refusal — see the abstention eval in evals/.
 DEMO_QUESTIONS = [
-    "What are the opening hours?",
-    "How much is a churros and chocolate combo?",
-    "Do you have gluten-free or vegan options?",
-    "What do I need to book catering for 80 people?",
+    "How quickly must a personal data breach be reported?",
+    "On what grounds can someone demand that their data be erased?",
+    "What is the maximum administrative fine?",
+    "Which countries have an adequacy decision?",
 ]
 
 
@@ -128,7 +131,10 @@ with st.sidebar:
 
 # ==================== MAIN CHAT ====================
 st.title("🧠 RAG Assistant with Intelligent Agent")
-st.caption("Reasons step by step and cites the source and page of every answer.")
+st.caption(
+    "Answers only from the indexed sources, and cites the provision behind every "
+    "statement — article and paragraph, not a page number."
+)
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -139,9 +145,12 @@ question = st.chat_input("Ask about your documents...")
 # be able to see a real answer without uploading anything.
 if DEMO_MODE and not st.session_state.chat_history:
     st.info(
-        "**Demo loaded:** the knowledge base of *Churrería Calderón* (a sample "
-        "small-business document) is already indexed. Ask anything below, or try one "
-        "of these. You can also upload your own PDFs in the sidebar."
+        "**Demo loaded:** the full text of the **GDPR** (Regulation (EU) 2016/679), "
+        "indexed as 414 provisions straight from EUR-Lex, so every answer cites the "
+        "article and paragraph it came from rather than a page number. Ask anything "
+        "below, or try one of these — the last one is not in the Regulation, and "
+        "saying so is the correct answer. You can also upload your own PDFs in the "
+        "sidebar."
     )
     cols = st.columns(2)
     for i, suggested in enumerate(DEMO_QUESTIONS):

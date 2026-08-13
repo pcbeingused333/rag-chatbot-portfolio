@@ -79,6 +79,9 @@ def test_the_demo_corpus_is_committed(demo_app):
     """
     Demo mode auto-indexes this file at startup. It is the whole demo, and a
     missing one turns the public app into an assistant that knows nothing.
+
+    It has to be committed rather than built on deploy: Streamlit Community Cloud
+    installs requirements and runs the app, and never runs corpus/build_gdpr_corpus.py.
     """
-    corpus = os.path.join(os.path.dirname(APP), "demo", "churreria_calderon.pdf")
-    assert os.path.exists(corpus)
+    corpus = os.path.join(os.path.dirname(APP), "corpus", "gdpr_en.jsonl")
+    assert os.path.exists(corpus), "run: python corpus/build_gdpr_corpus.py"
