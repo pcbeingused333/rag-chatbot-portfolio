@@ -182,17 +182,26 @@ provisions, where the competing passages are sibling paragraphs, they are not
 
 | Embedding model | hit@1 | recall@k | MRR | Peak RSS (model) | Peak RSS (model + index) |
 |---|---|---|---|---:|---:|
-| `all-MiniLM-L6-v2` | 8/20 | 12/20 | 0.48 | 599 MB | 834 MB |
-| **`bge-small-en-v1.5` (shipped)** | **13/20** | **17/20** | **0.74** | **641 MB** | **928 MB** |
+| `all-MiniLM-L6-v2` | 8/20 | 12/20 | 0.48 | 600 MB | 685 MB |
+| **`bge-small-en-v1.5` (shipped)** | **13/20** | **17/20** | **0.74** | **643 MB** | **743 MB** |
 | `multilingual-e5-small` | — | — | — | 988 MB | ✗ does not fit |
 | `paraphrase-multilingual-MiniLM-L12-v2` | — | — | — | 1232 MB | ✗ OOM |
 
-42 MB for +5 questions at rank 1 is a straightforward trade. The **928 MB** column is
-the honest one and it is new: the model alone understates what the container holds,
-and against a free tier's 1 GB the remaining margin is about 95 MB. It fits, and it
-does not fit comfortably. The `all-MiniLM-L6-v2` figure of 599 MB reproduces the
-number this project measured before the corpus changed, which is what makes the two
-columns comparable.
+43 MB for +5 questions at rank 1 is a straightforward trade. The `all-MiniLM-L6-v2`
+figure of 600 MB reproduces the number this project measured before the corpus
+changed, which is what makes the columns comparable.
+
+The **model + index** column is new, and it is the one that matters: the model alone
+understates what the container holds. Getting it required fixing the probe, which
+built its own embeddings object and so measured a configuration that is not deployed.
+
+That mattered more than it sounds. Encoding 32 texts per forward pass — the library
+default — costs about 185 MB of transient activation memory during the cold-start
+index build, against batches of 8. The vectors are identical either way: same hit@1,
+same recall, same per-question ranks. Measured end to end with Streamlit loaded, the
+first visitor peaked at **936 MB against a 1 GB tier**; at `EMBED_BATCH_SIZE=8` it
+peaks at **775 MB**. 88 MB of headroom is not a margin, it is a coin flip on the
+first person who opens the link.
 
 ### Cross-lingual retrieval: what an English-only index costs
 
@@ -293,7 +302,7 @@ app supports both behind a single `DEMO_MODE` environment variable.
 | External deps  | none                                    | a Postgres instance             |
 | Chunking       | 1500 / 200, `k=4`                       | 1000 / 200, `k=7`               |
 | Query language | translated to English before retrieval  | native (embeddings are multilingual) |
-| Peak RSS       | ~928 MB (fits the free 1 GB tier)       | ~2.5 GB                         |
+| Peak RSS       | ~775 MB with Streamlit (1 GB tier)      | ~2.5 GB                         |
 
 **Why:** a free Streamlit Community Cloud container has 1 GB of RAM, so `bge-m3`
 OOMs it, and a free hosted Postgres pauses when idle — which would leave the public

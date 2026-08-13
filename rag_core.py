@@ -128,11 +128,23 @@ def get_connection_string() -> str:
     return conn
 
 
+# Texts encoded per forward pass when the index is built. The default (32) costs
+# 185 MB of transient activation memory over batches of 8, for no benefit: the
+# vectors are identical either way — same hit@1, same recall, same per-question ranks
+# (python -m evals.run_eval retrieval) — and the smaller batch is marginally faster
+# here. It matters because the whole demo has to fit in a 1 GB container, and this
+# peak lands during the cold-start index build, i.e. on the first visitor.
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "8"))
+
+
 def get_embeddings():
     """Build the embedding model (heavy import kept local)."""
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    return HuggingFaceEmbeddings(model_name=resolve_embedding_model())
+    return HuggingFaceEmbeddings(
+        model_name=resolve_embedding_model(),
+        encode_kwargs={"batch_size": EMBED_BATCH_SIZE},
+    )
 
 
 def demo_pdf_paths() -> List[str]:

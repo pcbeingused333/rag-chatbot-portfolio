@@ -39,7 +39,16 @@ def main(argv) -> int:
 
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    embeddings = HuggingFaceEmbeddings(model_name=model_name)
+    import rag_core
+
+    # Same encode_kwargs the app ships with. Building the probe's own embeddings
+    # object without them measured a configuration that is not deployed — and since
+    # batch size drives the transient activation memory of the index build, that is
+    # exactly the part of the number this probe exists to capture.
+    embeddings = HuggingFaceEmbeddings(
+        model_name=model_name,
+        encode_kwargs={"batch_size": rag_core.EMBED_BATCH_SIZE},
+    )
     # Embed once: the model is lazy in places, and an unused model understates the
     # memory a request actually costs.
     embeddings.embed_query("How quickly must a personal data breach be reported?")
