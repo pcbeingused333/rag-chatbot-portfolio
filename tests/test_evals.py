@@ -448,3 +448,63 @@ def test_a_per_minute_limit_is_still_retried():
     exc = RuntimeError("429 rate limit ... on tokens per minute (TPM). try again in 1.6s")
     assert not rag_core.is_daily_budget_exhausted(exc)
     assert rag_core.is_transient_llm_error(exc)
+
+
+# --- the judge has to be a different model than the one it judges -------------
+
+
+def test_the_default_judge_is_not_the_shipped_model():
+    """The judge started as a separate model and silently stopped being one when the
+    shipped model changed under it: both defaults read `openai/gpt-oss-120b`, so every
+    judged number was self-assessed. Nothing failed — which is why this is a test."""
+    import rag_core
+    from evals import abstention, answers, judges
+
+    assert judges.DEFAULT_JUDGE_MODEL != rag_core.DEFAULT_LLM_MODEL
+    assert answers.DEFAULT_JUDGE_MODEL != rag_core.DEFAULT_LLM_MODEL
+    assert abstention.DEFAULT_JUDGE_MODEL != rag_core.DEFAULT_LLM_MODEL
+
+
+def test_a_run_that_would_grade_its_own_homework_is_refused():
+    from evals.judges import SelfJudgingError, check_judge_independence
+
+    with pytest.raises(SelfJudgingError):
+        check_judge_independence("openai/gpt-oss-120b", "openai/gpt-oss-120b")
+    # Case and stray whitespace are the same model, not a different one.
+    with pytest.raises(SelfJudgingError):
+        check_judge_independence("openai/gpt-oss-120b", " OpenAI/GPT-OSS-120B ")
+
+
+def test_two_different_models_are_allowed():
+    from evals.judges import check_judge_independence
+
+    check_judge_independence("openai/gpt-oss-120b", "qwen/qwen3.6-27b")
+
+
+def test_the_agent_path_stops_the_run_too_when_the_daily_budget_goes():
+    """The judge path stopped cleanly and the agent path did not: an exhausted budget
+    was caught by the per-question handler and recorded as an agent failure, which
+    turns one sentence about a spent budget into twenty-five bogus failures."""
+    import rag_core
+    from evals import answers
+
+    class BrokeAgent:
+        def invoke(self, _state):
+            raise rag_core.DailyBudgetExhausted("tokens per day (TPD)")
+
+    question = QUESTIONS[0]
+    with pytest.raises(rag_core.DailyBudgetExhausted):
+        answers._answer(BrokeAgent(), question)
+
+
+def test_an_ordinary_agent_failure_is_still_scored_as_a_miss():
+    """The re-raise above must not turn every agent error into a stopped run."""
+    from evals import answers
+
+    class FlakyAgent:
+        def invoke(self, _state):
+            raise RuntimeError("500 internal server error")
+
+    result = answers._answer(FlakyAgent(), QUESTIONS[0])
+    assert result["answer"] == ""
+    assert "RuntimeError" in result["error"]

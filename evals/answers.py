@@ -19,12 +19,14 @@ from typing import Dict, List, Optional
 
 import rag_core
 from evals.dataset import Question, questions as load_questions
-from evals.judges import QualityScores, judge, mean
+from evals.judges import (
+    DEFAULT_JUDGE_MODEL,
+    QualityScores,
+    check_judge_independence,
+    judge,
+    mean,
+)
 from evals.metrics import provision_rank
-
-# A separate, larger judge model: having the model under test grade its own homework
-# is the one shortcut that invalidates the whole exercise.
-DEFAULT_JUDGE_MODEL = "openai/gpt-oss-120b"
 
 
 def _make_judge_callable(judge_model: str):
@@ -54,6 +56,11 @@ def _answer(agent, question: Question) -> Dict:
             agent, [HumanMessage(content=question.question)]
         )
         return {"answer": answer, "error": None}
+    except rag_core.DailyBudgetExhausted:
+        # Not a failure of the agent: it never got to answer. Swallowing it here is
+        # how a run comes back as twenty-five agent errors instead of one sentence
+        # saying the budget is gone.
+        raise
     except Exception as exc:  # noqa: BLE001 — recorded and scored as a miss
         return {"answer": "", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -75,6 +82,7 @@ def run(
 
     model = model or rag_core.resolve_llm_model()
     judge_model = judge_model or DEFAULT_JUDGE_MODEL
+    check_judge_independence(model, judge_model)
     print(f"System under test: {model}")
     print(f"Judge: {judge_model}")
     print(f"Questions: {len(dataset)}\n")
@@ -99,7 +107,11 @@ def run(
     stopped_early: Optional[str] = None
     for index, question in enumerate(dataset, start=1):
         captured.clear()
-        result = _answer(agent, question)
+        try:
+            result = _answer(agent, question)
+        except rag_core.DailyBudgetExhausted as exc:
+            stopped_early = str(exc)
+            break
         contexts = [doc.page_content for doc in captured]
         grounded = (
             provision_rank(

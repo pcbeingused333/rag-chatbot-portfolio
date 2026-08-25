@@ -26,6 +26,15 @@ The definitions:
 
 Faithfulness and correctness answer different questions: an answer can be perfectly
 faithful to passages that do not contain what was asked for.
+
+Who judges. Not the model under test — a model asked whether its own answer is
+faithful is being asked to find its own mistakes, which is the one shortcut that
+invalidates the whole exercise. That was written down from the start and stopped
+being true silently: the judge was `openai/gpt-oss-120b` because the system under
+test used to be `llama-3.3-70b-versatile`, and when the shipped model became
+`gpt-oss-120b` the judge stayed where it was. Nothing failed; the numbers just
+quietly became self-assessed. `DEFAULT_JUDGE_MODEL` now names a different family,
+and `check_judge_independence` refuses to let the two collapse again in silence.
 """
 import json
 import re
@@ -237,3 +246,33 @@ def judge(llm, question: str, answer: str, reference: str, contexts: List[str]) 
         supported_claims=sum(1 for v in verdicts if v.get("supported") is True),
         note=note,
     )
+
+
+# A different vendor's model, not a bigger one from the same family. What the metric
+# needs is an independent reader; size is not the property that makes it independent.
+# `qwen/qwen3.6-27b` is the one on Groq that is neither the shipped model nor a
+# sibling of it, and it answered 10/10 in the tool-call probe.
+#
+# It also happens to solve an operating problem: Groq meters the daily token budget
+# **per model**, so a judge on a different model draws on a separate allowance. The
+# `answers` run costs roughly the whole daily budget of one model, which is why it
+# kept dying half-way when the judge and the system under test shared it.
+DEFAULT_JUDGE_MODEL = "qwen/qwen3.6-27b"
+
+
+class SelfJudgingError(RuntimeError):
+    """The judge and the system under test are the same model."""
+
+
+def check_judge_independence(model: str, judge_model: str) -> None:
+    """Refuse a run where the model would grade its own homework.
+
+    Explicit is the point: passing --judge-model equal to --model is allowed nowhere,
+    because the resulting numbers are not the thing the table claims to report.
+    """
+    if model.strip().lower() == judge_model.strip().lower():
+        raise SelfJudgingError(
+            f"The judge and the system under test are both `{model}`. A model scoring "
+            "its own answers reports how confident it is, not how correct it is. "
+            f"Pass --judge-model with a different model (default: {DEFAULT_JUDGE_MODEL})."
+        )

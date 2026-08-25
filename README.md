@@ -250,6 +250,14 @@ questions it never asked a judge were reported as failures rather than as unmeas
 which is the defect described two sections down, and is why this table can now only be
 printed for the questions that were actually scored.
 
+**One caveat on this table, stated rather than buried.** It was judged by
+`openai/gpt-oss-120b`, which is also the model under test — the defect described two
+sections down, found after this run. The verdict a judge returns here is a
+classification (*did this answer decline, hedge, or answer?*) rather than a quality
+score it awards itself, so it is the least exposed of the judged numbers, and the
+deterministic columns — searched before replying, citations never retrieved — need no
+judge at all. It gets regenerated against the independent judge regardless.
+
 ### Tool-call reliability per model
 
 `python -m evals.run_eval tool-calls` — the same 10 questions to each model with **no
@@ -298,13 +306,45 @@ under test and nothing else, so the *judge* still called the API directly: the
 threw away the six questions already paid for. Both judges now go through the same
 policy.
 
-And a per-day budget was being treated as a per-minute one. Groq reports both through
+And a per-day budget was being treated as a per-minute one — on both paths, in
+different ways. Groq reports both through
 a 429, but the remedy differs in kind: the per-minute window refills while the run
 waits, whereas the per-day one answers *"try again in 13m54s"*, so backing off just
 spends every attempt to be told the same thing. `DailyBudgetExhausted` is now raised
 on the first sight of it, and a run that hits it **stops, keeps what it scored, says
 how far it got and exits non-zero** — because the failure that matters is not the
 stop, it is an eleven-question mean being read as the score for twenty-five.
+
+The agent path needed the opposite change. It already caught everything per question
+and scored it as a miss, which is right for a timeout and wrong for a spent budget: a
+run against an exhausted allowance came back as twenty-five agent failures, a table
+that looks like a broken agent rather than a run that never happened. That one
+exception now travels up to the same handler.
+
+### The judge stopped being independent, and nothing failed
+
+The rule was written into the harness on day one: the model under test does not grade
+its own homework. It stopped holding without a single error.
+
+`DEFAULT_JUDGE_MODEL` was `openai/gpt-oss-120b` because the system under test was
+`llama-3.3-70b-versatile` — a separate model, and a bigger one. When the shipped model
+became `gpt-oss-120b`, the judge stayed where it was. From then on both constants read
+the same string, three feet apart in two files, under a comment calling that exact
+arrangement *the one shortcut that invalidates the whole exercise*. Every judged number
+since was self-assessed.
+
+The fix is a different family rather than a bigger sibling — independence is the
+property the metric needs, not size — so the judge is now `qwen/qwen3.6-27b`, which
+answered 10/10 in the probe above. `check_judge_independence` raises before a run
+starts if the two ever collapse again, and a test pins the two defaults apart, because
+this failure produced no symptom to notice.
+
+**It also unblocked the budget.** Groq meters the daily token allowance *per model*: a
+request to `gpt-oss-120b` was being refused for the day while `gpt-oss-20b` and
+`qwen/qwen3.6-27b` answered a 3,000-token request without complaint. Judge and system
+under test had been sharing one allowance, which is why the 25-question run kept dying
+half-way. With the judge drawing on its own, roughly three quarters of the cost moves
+off the critical budget.
 
 ### Not yet re-measured against this corpus
 
@@ -314,14 +354,19 @@ were taken against the previous corpus and a different system prompt. Carrying t
 forward would be the exact mistake the heading experiment above exists to warn about.
 
 What it needs is a day, not a fix. At roughly four calls a question — one agent turn
-and three judge calls — a full pass costs about the whole 200,000-token daily
-allowance of Groq's free tier. The last attempt got 11 questions in before the budget
-ran out, on a day that had already paid for the abstention and tool-call runs above,
-and at the time it died there with a traceback: the partial-run handling described
-above is what that failure bought. So this command has to be the first thing run on a
-fresh day, and it has to finish in one pass. Merging a partial run into an older one
-is how a mean stops meaning anything, which is why no number from that attempt is
-quoted here.
+and three judge calls — a full pass used to cost about the whole 200,000-token daily
+allowance of Groq's free tier, because the judge and the system under test spent the
+same one. Two attempts died half-way: the first at question 7 with a traceback, the
+second at question 11, and the last one at question 1, on a budget already spent by
+the runs above. The partial-run handling and the independent judge are what those
+failures bought.
+
+Now that the judge draws on a separate model's allowance, only the agent turns come
+out of the shipped model's budget — roughly a quarter of the previous cost, which
+fits a full pass comfortably. It still has to finish in one run: merging a partial
+into an older one is how a mean stops meaning anything, which is why no number from
+any of those attempts is quoted here. The abstention table above is queued behind the
+same fresh budget, to be re-judged by the independent judge.
 
 ## 🧱 Tech Stack
 
@@ -423,7 +468,7 @@ the list.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                                  # 78 tests, no Postgres or API key needed
+pytest -q                                  # 83 tests, no Postgres or API key needed
 python -m evals.run_eval retrieval --sweep # scores retrieval, also no API key
 ```
 
