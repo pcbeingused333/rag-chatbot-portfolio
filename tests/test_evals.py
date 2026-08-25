@@ -330,3 +330,121 @@ def test_search_tool_says_so_when_nothing_is_found():
 
     tool = rag_core.make_search_tool(EmptyRetriever())
     assert "No relevant information" in tool.invoke({"query": "anything"})
+
+
+# --- tool-call probe: a retired model is not a failing model ------------------
+
+
+def test_a_retired_model_is_reported_as_unavailable_not_as_a_100_percent_failure():
+    """Groq retired `llama-3.3-70b-versatile` and the probe scored it 0/10 answered,
+    100% failure rate — which reads as a model that cannot emit a tool call, when no
+    request ever reached a model. The distinction is the whole point of the table."""
+    from evals import tool_calls
+
+    class MissingModelAgent:
+        def invoke(self, _state):
+            raise RuntimeError(
+                "Error code: 404 - {'error': {'message': 'The model "
+                "`llama-3.3-70b-versatile` does not exist or you do not have access "
+                "to it.', 'code': 'model_not_found'}}"
+            )
+
+    report = tool_calls._probe_with_agent(MissingModelAgent(), "llama-3.3-70b-versatile", attempts=10)
+
+    assert report.unavailable == "model_not_found"
+    assert report.failure_rate is None
+    assert report.tool_call_failures == 0
+    assert report.other_failures == 0
+    # Stopped on the first refusal instead of spending the other nine requests.
+    assert report.attempts == 0
+
+
+def test_a_model_that_cannot_emit_a_tool_call_is_still_scored():
+    """The guard above must not swallow the failure the probe exists to measure."""
+    from evals import tool_calls
+
+    class MalformedToolCallAgent:
+        def invoke(self, _state):
+            raise RuntimeError("Error code: 400 - {'error': {'code': 'tool_use_failed'}}")
+
+    report = tool_calls._probe_with_agent(MalformedToolCallAgent(), "some-model", attempts=3)
+
+    assert report.unavailable is None
+    assert report.attempts == 3
+    assert report.tool_call_failures == 3
+    assert report.failure_rate == 1.0
+
+
+# --- the judge is as rate-limited as the model it judges ----------------------
+
+
+def test_a_rate_limited_judge_waits_and_retries_instead_of_killing_the_run():
+    """The `answers` run died at question 7 of 25 on a tokens-per-minute 429 raised
+    by a judge call, throwing away the six questions already paid for. The agent path
+    had backoff; the judge path called the API directly."""
+    import rag_core
+
+    waits = []
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError(
+                "Error code: 429 - rate limit reached ... on tokens per minute (TPM)"
+            )
+        return "verdict"
+
+    assert rag_core.call_llm_with_retry(flaky, sleep=waits.append) == "verdict"
+    assert attempts["n"] == 3
+    # It waited, and waited longer the second time, rather than spending the retry
+    # immediately on a budget that only refills with the clock.
+    assert len(waits) == 2 and waits[1] > waits[0]
+
+
+def test_a_judge_failure_a_retry_cannot_fix_is_raised_at_once():
+    import rag_core
+
+    attempts = {"n": 0}
+
+    def bad_key():
+        attempts["n"] += 1
+        raise RuntimeError("Error code: 401 - invalid api key")
+
+    with pytest.raises(RuntimeError):
+        rag_core.call_llm_with_retry(bad_key, sleep=lambda _s: None)
+    assert attempts["n"] == 1
+
+
+# --- a daily budget is not a transient failure -------------------------------
+
+
+def test_a_daily_budget_exhaustion_is_not_retried():
+    """Groq reports the per-day and the per-minute budget through the same 429. The
+    per-minute one refills while the run waits; the per-day one says "try again in
+    13m54s", so backing off spends attempts to be told the same thing."""
+    import rag_core
+
+    waits = []
+    attempts = {"n": 0}
+
+    def spent():
+        attempts["n"] += 1
+        raise RuntimeError(
+            "Error code: 429 - Rate limit reached ... on tokens per day (TPD): "
+            "Limit 200000, Used 199927. Please try again in 13m54.624s"
+        )
+
+    with pytest.raises(rag_core.DailyBudgetExhausted):
+        rag_core.call_llm_with_retry(spent, sleep=waits.append)
+    assert attempts["n"] == 1
+    assert waits == []
+
+
+def test_a_per_minute_limit_is_still_retried():
+    """The guard above must not turn every 429 into a stopped run."""
+    import rag_core
+
+    exc = RuntimeError("429 rate limit ... on tokens per minute (TPM). try again in 1.6s")
+    assert not rag_core.is_daily_budget_exhausted(exc)
+    assert rag_core.is_transient_llm_error(exc)

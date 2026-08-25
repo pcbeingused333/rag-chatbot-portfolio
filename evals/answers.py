@@ -35,7 +35,12 @@ def _make_judge_callable(judge_model: str):
     llm = ChatGroq(model=judge_model, temperature=0)
 
     def call(prompt: str) -> str:
-        return llm.invoke([HumanMessage(content=prompt)]).content
+        # Through the retry policy, not straight at the API: a judge is as exposed to
+        # the per-minute token budget as the agent is, and a 429 here throws away
+        # every question already paid for in this run.
+        return rag_core.call_llm_with_retry(
+            lambda: llm.invoke([HumanMessage(content=prompt)]).content
+        )
 
     return call
 
@@ -91,6 +96,7 @@ def run(
     call_judge = _make_judge_callable(judge_model)
 
     rows: List[Dict] = []
+    stopped_early: Optional[str] = None
     for index, question in enumerate(dataset, start=1):
         captured.clear()
         result = _answer(agent, question)
@@ -106,13 +112,19 @@ def run(
         if result["error"]:
             scores = QualityScores(None, None, None, None, note=result["error"][:200])
         else:
-            scores = judge(
-                call_judge,
-                question=question.question,
-                answer=result["answer"],
-                reference=question.reference,
-                contexts=contexts,
-            )
+            try:
+                scores = judge(
+                    call_judge,
+                    question=question.question,
+                    answer=result["answer"],
+                    reference=question.reference,
+                    contexts=contexts,
+                )
+            except rag_core.DailyBudgetExhausted as exc:
+                # Everything scored so far is still a measurement. Keep it, say what
+                # the run did not reach, and let the caller resume tomorrow.
+                stopped_early = str(exc)
+                break
 
         rows.append(
             {
@@ -141,13 +153,23 @@ def run(
             f"corr {_fmt(scores.answer_correctness)}"
         )
 
+    if stopped_early:
+        print(
+            f"\nStopped after {len(rows)}/{len(dataset)} questions — the daily token "
+            "budget is spent. The scores below cover only what was measured; the rest "
+            "of the set has to be run on a fresh budget, not merged with an older run."
+        )
+        print(f"  {stopped_early[:200]}")
+
     _summarise(rows)
 
     if json_path:
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(rows, handle, indent=2, ensure_ascii=False)
         print(f"\nWrote {json_path}")
-    return 0
+    # A partial run is not a pass: the exit code has to keep CI and a human from
+    # reading an eleven-question mean as the score for twenty-five.
+    return 3 if stopped_early else 0
 
 
 def _fmt(value: Optional[float]) -> str:

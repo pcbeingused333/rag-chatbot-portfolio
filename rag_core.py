@@ -366,6 +366,22 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _RETRYABLE_MARKERS)
 
 
+class DailyBudgetExhausted(RuntimeError):
+    """The account's tokens-per-day allowance is gone.
+
+    Kept apart from the other rate limits because the remedy is different in kind.
+    A per-minute budget refills while the run waits; a per-day one does not, and
+    retrying it spends attempts to be told the same thing for another quarter of an
+    hour. What a run should do here is stop, keep the questions it already scored,
+    and say why — not die on question 11 with a traceback.
+    """
+
+
+def is_daily_budget_exhausted(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "tokens per day" in text or "(tpd)" in text
+
+
 def is_rate_limited(exc: BaseException) -> bool:
     """Whether a failure is a budget that refills with time rather than a glitch."""
     text = str(exc).lower()
@@ -373,6 +389,37 @@ def is_rate_limited(exc: BaseException) -> bool:
         marker in text
         for marker in ("rate limit", "429", "413", "request too large", "tokens per minute")
     )
+
+
+def call_llm_with_retry(call, attempts: int = 5, sleep=None):
+    """
+    Run a plain LLM call — no agent, no tools — under the same retry policy.
+
+    The eval harness needs this for its judges. `invoke_agent_with_retry` covers the
+    agent under test, so a 429 there waits and recovers; a judge called directly did
+    not, and the `answers` run died at question 7 of 25 on a tokens-per-minute limit
+    after paying for the six before it. The failure is identical, so the handling is.
+
+    More attempts than the agent path by default: a judge failure is always the
+    per-minute budget rather than a malformed tool call, and that budget needs the
+    window to move rather than another try.
+    """
+    import time
+
+    sleep = sleep or time.sleep
+    last: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001 — re-raised below
+            last = exc
+            if is_daily_budget_exhausted(exc):
+                raise DailyBudgetExhausted(str(exc)) from exc
+            if not is_transient_llm_error(exc) or attempt == attempts - 1:
+                raise
+            if is_rate_limited(exc):
+                sleep(_backoff_seconds(attempt))
+    raise last  # unreachable, kept for type-checkers
 
 
 def invoke_agent_with_retry(agent, messages, attempts: int = 3, sleep=None):
@@ -396,6 +443,8 @@ def invoke_agent_with_retry(agent, messages, attempts: int = 3, sleep=None):
             return result["messages"][-1].content
         except Exception as exc:  # noqa: BLE001 — re-raised below
             last = exc
+            if is_daily_budget_exhausted(exc):
+                raise DailyBudgetExhausted(str(exc)) from exc
             if not is_transient_llm_error(exc) or attempt == attempts - 1:
                 raise
             if is_rate_limited(exc):
@@ -408,8 +457,9 @@ def invoke_agent_with_retry(agent, messages, attempts: int = 3, sleep=None):
 # same prompt, the same tool and the same retriever the user talks to. An eval that
 # builds its own copy of the agent measures its own copy, not the product.
 
-# llama-3.3-70b-versatile emits malformed tool calls often enough on Groq to break
-# the agent on roughly half of all questions. Reproduce with:
+# The model is the variable the tool-call probe exists to measure — a model that
+# emits a malformed tool call cannot answer at all, since the agent has exactly one
+# tool. Reproduce with:
 #     python -m evals.run_eval tool-calls
 DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 

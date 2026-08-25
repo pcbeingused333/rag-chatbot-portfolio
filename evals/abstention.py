@@ -82,7 +82,11 @@ def _make_judge_callable(judge_model: str):
     llm = ChatGroq(model=judge_model, temperature=0)
 
     def call(prompt: str) -> str:
-        return llm.invoke([HumanMessage(content=prompt)]).content
+        # Same retry policy as the agent under test: this judge is the reason three
+        # of seven questions came back unscored on an earlier run.
+        return rag_core.call_llm_with_retry(
+            lambda: llm.invoke([HumanMessage(content=prompt)]).content
+        )
 
     return call
 
@@ -189,6 +193,7 @@ def run(
     call_judge = _make_judge_callable(judge_model)
 
     rows: List[Dict] = []
+    stopped_early: Optional[str] = None
     for index, question in enumerate(dataset, start=1):
         captured.clear()
         result = _ask(agent, question)
@@ -197,15 +202,22 @@ def run(
         if result["error"]:
             verdict = {"verdict": "error", "why": result["error"][:200]}
         else:
-            verdict = _parse_verdict(
-                call_judge(
-                    JUDGE_PROMPT.format(
-                        question=question.question,
-                        contexts="\n\n".join(contexts) or "(nothing retrieved)",
-                        answer=result["answer"],
+            try:
+                verdict = _parse_verdict(
+                    call_judge(
+                        JUDGE_PROMPT.format(
+                            question=question.question,
+                            contexts="\n\n".join(contexts) or "(nothing retrieved)",
+                            answer=result["answer"],
+                        )
                     )
                 )
-            )
+            except rag_core.DailyBudgetExhausted as exc:
+                # An unscored question is not an abstention failure. Reporting it as
+                # one is how a table ends up saying 4/7 abstained when the other
+                # three were never asked a judge.
+                stopped_early = str(exc)
+                break
 
         invented = fabricated_citations(result["answer"], captured)
         rows.append(
@@ -230,13 +242,22 @@ def run(
             + (f", INVENTED {', '.join(invented)}" if invented else "")
         )
 
+    if stopped_early:
+        print(
+            f"\nStopped after {len(rows)}/{len(dataset)} questions — the daily token "
+            "budget is spent. What follows scores only those; the rest were not asked."
+        )
+        print(f"  {stopped_early[:200]}")
+
     _summarise(rows)
 
     if json_path:
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(rows, handle, indent=2, ensure_ascii=False)
         print(f"\nWrote {json_path}")
-    return 0
+    # A partial run must not exit 0: that is how its table gets quoted as the score
+    # for the whole set.
+    return 3 if stopped_early else 0
 
 
 def _summarise(rows: List[Dict]) -> None:

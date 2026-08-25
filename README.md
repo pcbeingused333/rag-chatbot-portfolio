@@ -230,10 +230,11 @@ each adjacent enough that the model has certainly read about it.
 
 | Outcome | |
 |---|---:|
-| Abstained (correct) | **4/4 scored** |
+| Abstained (correct) | **7/7** |
+| Hedged | 0 |
 | Answered anyway | 0 |
+| Searched before replying | 7/7 |
 | Answers citing a provision never retrieved | 0 |
-| Not scored — daily token quota exhausted | 3/7 |
 
 The refusals are specific rather than blanket, which is the behaviour worth having.
 Asked which countries have an adequacy decision, it retrieved Article 45(3), (4), (5)
@@ -243,11 +244,37 @@ list itself is not in the indexed text. Asked for the wording of the standard
 contractual clauses, it cited Article 28(7) and 28(8) as the provisions that empower
 the Commission to adopt them, and said the wording is not present.
 
-**Three of the seven are unscored, and that is a real gap, not a rounding error.**
-Groq's free tier ran out of *tokens per day* mid-run. The earlier run of the same
-seven, at a different retrieval setting, scored 6/6 abstained with 0 answered and 0
-fabricated citations, which is consistent but is not the same measurement. This table
-should be regenerated in one clean run.
+All seven in one clean run, on the shipped configuration. An earlier attempt scored
+only four of them: Groq's free tier ran out of *tokens per day* mid-run and the three
+questions it never asked a judge were reported as failures rather than as unmeasured —
+which is the defect described two sections down, and is why this table can now only be
+printed for the questions that were actually scored.
+
+### Tool-call reliability per model
+
+`python -m evals.run_eval tool-calls` — the same 10 questions to each model with **no
+retry**, so what it reports is the raw per-request rate. The agent has exactly one
+tool, so a model that emits a malformed tool call cannot answer at all.
+
+| Model | Answered | Malformed tool calls | Failure rate |
+|---|---|---|---:|
+| `openai/gpt-oss-120b` (shipped) | 9/10 | 0/10 | 10% |
+| `openai/gpt-oss-20b` | 9/10 | 0/10 | 10% |
+| `qwen/qwen3.6-27b` | 10/10 | 0/10 | 0% |
+
+Zero malformed tool calls across 30 requests. The two failures were per-minute rate
+limits, which is a property of the free tier rather than of the model — the number
+this command exists to isolate is the middle column, and on these three it is a flat
+zero. That is a change from what this table used to say: the second model was
+`llama-3.3-70b-versatile`, which emitted malformed tool calls often enough to break
+the agent on roughly half of all questions, and is the reason the retry classifier
+treats `tool_use_failed` as transient at all.
+
+**The probe was wrong about it, though.** Groq retired that model, and the run
+reported it as 0/10 answered, 100% failure rate — a number that reads as *this model
+cannot emit a tool call* when in fact no request ever reached a model. A missing model
+is now detected on the first refusal, reported as `not available on Groq` with no
+score at all, and the remaining nine requests are not spent proving it again.
 
 ### An operational finding the eval produced by accident
 
@@ -265,19 +292,36 @@ thing. A malformed tool call still retries immediately — the two failures dese
 different treatment, and `test_a_token_budget_error_is_retried_but_only_after_waiting`
 pins that distinction.
 
+**The same run found two more, one layer up.** The backoff above protected the agent
+under test and nothing else, so the *judge* still called the API directly: the
+`answers` run died at question 7 of 25 on a per-minute limit raised by a judge, and
+threw away the six questions already paid for. Both judges now go through the same
+policy.
+
+And a per-day budget was being treated as a per-minute one. Groq reports both through
+a 429, but the remedy differs in kind: the per-minute window refills while the run
+waits, whereas the per-day one answers *"try again in 13m54s"*, so backing off just
+spends every attempt to be told the same thing. `DailyBudgetExhausted` is now raised
+on the first sight of it, and a run that hits it **stops, keeps what it scored, says
+how far it got and exits non-zero** — because the failure that matters is not the
+stop, it is an eleven-question mean being read as the score for twenty-five.
+
 ### Not yet re-measured against this corpus
 
-Two commands in the harness still report numbers taken against the previous corpus,
-so they are **not quoted in this README**. Both need a clean run once the daily quota
-resets:
+One command is left. `answers` scores end-to-end quality against all 25 legal
+questions and it is **not quoted in this README**, because the only numbers it has
+were taken against the previous corpus and a different system prompt. Carrying them
+forward would be the exact mistake the heading experiment above exists to warn about.
 
-| Command | Why it has to be re-run |
-|---|---|
-| `answers` | End-to-end quality against 25 legal questions and a rewritten system prompt. Roughly 100 API calls. |
-| `tool-calls` | The raw malformed-tool-call rate per model. The tool description and system prompt both changed, and the old figure was measured under the old ones. |
-
-Carrying those numbers forward would be the exact mistake the heading experiment
-above exists to warn about.
+What it needs is a day, not a fix. At roughly four calls a question — one agent turn
+and three judge calls — a full pass costs about the whole 200,000-token daily
+allowance of Groq's free tier. The last attempt got 11 questions in before the budget
+ran out, on a day that had already paid for the abstention and tool-call runs above,
+and at the time it died there with a traceback: the partial-run handling described
+above is what that failure bought. So this command has to be the first thing run on a
+fresh day, and it has to finish in one pass. Merging a partial run into an older one
+is how a mean stops meaning anything, which is why no number from that attempt is
+quoted here.
 
 ## 🧱 Tech Stack
 
@@ -379,7 +423,7 @@ the list.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                                  # 72 tests, no Postgres or API key needed
+pytest -q                                  # 78 tests, no Postgres or API key needed
 python -m evals.run_eval retrieval --sweep # scores retrieval, also no API key
 ```
 
