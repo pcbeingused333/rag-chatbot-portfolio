@@ -37,6 +37,7 @@ import re
 from typing import Dict, List, Optional
 
 import rag_core
+from evals import judges
 from evals.dataset import Unanswerable, unanswerable as load_unanswerable
 from evals.judges import DEFAULT_JUDGE_MODEL, check_judge_independence
 
@@ -132,14 +133,17 @@ def fabricated_citations(answer: str, docs) -> List[str]:
 
 
 def _parse_verdict(raw: str) -> Dict:
-    """Pull the JSON object out of a judge reply, tolerating stray prose."""
-    match = re.search(r"\{.*\}", raw or "", re.S)
-    if not match:
-        return {"verdict": "unparsed", "why": (raw or "")[:120]}
+    """
+    Pull the JSON object out of a judge reply, tolerating prose and reasoning.
+
+    Shares `judges.parse_json_object` rather than keeping a second regex here. The
+    duplicate was the whole cost of this bug: when the judge moved to a family that
+    inlines `<think>`, two parsers had to learn about it and only one was looked at.
+    """
     try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {"verdict": "unparsed", "why": (raw or "")[:120]}
+        data = judges.parse_json_object(raw or "")
+    except (ValueError, json.JSONDecodeError):
+        return {"verdict": "unparsed", "why": judges.strip_reasoning(raw or "")[:120] or (raw or "")[:120]}
     verdict = str(data.get("verdict", "unparsed")).lower().strip()
     if verdict not in {"abstained", "hedged", "answered"}:
         verdict = "unparsed"

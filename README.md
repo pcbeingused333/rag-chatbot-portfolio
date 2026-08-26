@@ -368,6 +368,32 @@ into an older one is how a mean stops meaning anything, which is why no number f
 any of those attempts is quoted here. The abstention table above is queued behind the
 same fresh budget, to be re-judged by the independent judge.
 
+**The re-judge was attempted on 26 August and produced nothing, for a new reason.**
+Moving the judge to a different family to stop the shipped model grading its own
+answers also changed the *shape* of a judge reply, and nothing checked that. The
+`gpt-oss` models on Groq return their reasoning out of band, in a separate field, so
+the message content was clean JSON; Qwen inlines it as a `<think>` block. The
+reasoning is where a model restates the schema it was asked for, so it contains
+braces, and the parser's greedy `{.*}` ran from a brace inside the reasoning to the
+last brace of the real answer — a span that could never parse.
+
+What that looked like is the part worth keeping: every abstention verdict came back
+`unparsed`, so the run reported **0/6 abstained** while the agent had in fact abstained
+correctly on every question. And the `answers` run printed a full table of `n/a` under
+a zero exit status, which reads as a completed run rather than a failed one. A judged
+metric coming back empty for one question is ordinary — a refusal has no claims to be
+unfaithful about. Every metric empty on every question is the judge being unreadable,
+and it now exits non-zero and says so.
+
+Fixed: `strip_reasoning` removes the block, JSON extraction is brace-balanced rather
+than greedy and reads the last object rather than the first, and `abstention` shares
+that one parser instead of keeping a second regex — the duplicate is the whole reason
+the change had to be noticed twice and was noticed nowhere. Eight regression tests,
+six of which fail with the fix reverted; the other two pin the new scanner's own
+failure modes and say so in the file. Neither run's numbers are quoted here: the
+`answers` judged metrics measured nothing, and the abstention pass stopped at 6 of 7
+on a spent daily budget.
+
 ## 🧱 Tech Stack
 
 | Layer            | Technology                                  |

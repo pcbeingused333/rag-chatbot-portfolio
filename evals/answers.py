@@ -179,9 +179,38 @@ def run(
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(rows, handle, indent=2, ensure_ascii=False)
         print(f"\nWrote {json_path}")
+
+    if rows and _judge_produced_nothing(rows):
+        print(
+            "\nEvery judged metric came back empty across all "
+            f"{len(rows)} questions. That is not a score of zero and it is not a "
+            "hard set — it is the judge's replies not being readable, which is a "
+            "harness fault. The deterministic grounded-retrieval count above still "
+            "holds; nothing else in this run is publishable."
+        )
+        return 4
+
     # A partial run is not a pass: the exit code has to keep CI and a human from
     # reading an eleven-question mean as the score for twenty-five.
     return 3 if stopped_early else 0
+
+
+# The judged metrics. Grounded retrieval is deliberately not here: it is computed
+# without a judge, so it stays valid exactly when these do not.
+_JUDGED_METRICS = ("faithfulness", "answer_relevancy", "answer_correctness", "context_precision")
+
+
+def _judge_produced_nothing(rows: List[Dict]) -> bool:
+    """
+    True when not one judged metric was scored in the whole run.
+
+    Worth a separate exit code because of how it looked the first time: a table of
+    `n/a` printed under a zero exit status, which reads as a finished run. One
+    question scoring None is ordinary — a refusal has no claims to be unfaithful
+    about. Every metric on every question scoring None is the judge failing to
+    parse, and the run has measured nothing it set out to measure.
+    """
+    return all(row.get(metric) is None for row in rows for metric in _JUDGED_METRICS)
 
 
 def _fmt(value: Optional[float]) -> str:

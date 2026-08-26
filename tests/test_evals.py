@@ -7,7 +7,7 @@ here — the substring matching, the aggregates, the judge parsing.
 """
 import pytest
 
-from evals import judges
+from evals import abstention, answers, judges
 from evals.dataset import QUESTIONS, UNANSWERABLE, questions
 from evals.metrics import (
     QuestionResult,
@@ -192,6 +192,76 @@ def test_parse_json_object_raises_rather_than_returning_an_empty_dict():
     # An empty dict would score as zero and be indistinguishable from a bad answer.
     with pytest.raises(ValueError):
         judges.parse_json_object("I could not answer that.")
+
+
+# The judge moved to Qwen to stop the shipped model grading its own answers. Qwen
+# inlines its reasoning in the message content instead of returning it out of band
+# the way the gpt-oss models do, so the reply shape changed and every judged metric
+# silently came back n/a. These pin the shape, not just the parse.
+
+# The reasoning restates the schema it was asked for, so it contains braces — which
+# is why the old greedy `{.*}` ran from inside the reasoning to the real closing
+# brace and could never parse.
+JUDGE_REPLY_WITH_REASONING = (
+    "<think>\n"
+    'The user wants a verdict shaped like {"verdict": "abstained", "why": "..."}.\n'
+    "The reply says the corpus does not contain the list, so it abstained.\n"
+    "</think>\n"
+    '{"verdict": "abstained", "why": "Says the corpus does not cover it."}'
+)
+
+
+def test_parse_json_object_ignores_braces_inside_a_think_block():
+    assert judges.parse_json_object(JUDGE_REPLY_WITH_REASONING) == {
+        "verdict": "abstained",
+        "why": "Says the corpus does not cover it.",
+    }
+
+
+# The next two pass against the old parser too, and are kept anyway: they pin the
+# failure modes the *new* balanced scanner introduces — truncation and braces inside
+# strings — rather than the regression above. Said out loud so nobody counts them as
+# evidence the bug is caught.
+
+def test_parse_json_object_rejects_a_reply_cut_off_inside_its_reasoning():
+    # Truncated before the answer: there is no verdict, and the deliberations are
+    # not one. A parse failure here is the correct, loud outcome.
+    with pytest.raises(ValueError):
+        judges.parse_json_object('<think>The shape is {"verdict": ')
+
+
+def test_parse_json_object_takes_the_last_object_not_the_first():
+    # Prose around a JSON reply is a preamble far more often than a postscript.
+    response = 'For reference the shape is {"verdict": "x"}.\n{"verdict": "hedged"}'
+    assert judges.parse_json_object(response) == {"verdict": "hedged"}
+
+
+def test_parse_json_object_is_not_fooled_by_braces_inside_strings():
+    assert judges.parse_json_object('{"why": "it printed { and never closed it"}') == {
+        "why": "it printed { and never closed it"
+    }
+
+
+def test_strip_reasoning_leaves_an_ordinary_reply_alone():
+    assert judges.strip_reasoning('  {"verdict": "hedged"}  ') == '{"verdict": "hedged"}'
+
+
+def test_abstention_reads_a_verdict_wrapped_in_reasoning():
+    # The regression that mattered: a correct abstention scored `unparsed`, so the
+    # published table read 0/6 abstained when the system had abstained every time.
+    assert abstention._parse_verdict(JUDGE_REPLY_WITH_REASONING)["verdict"] == "abstained"
+
+
+def test_a_run_where_the_judge_scored_nothing_does_not_exit_clean():
+    # A table of n/a under exit 0 reads as a finished run. It is a harness fault.
+    nothing = [dict.fromkeys(answers._JUDGED_METRICS)]
+    assert answers._judge_produced_nothing(nothing)
+
+
+def test_one_unscored_question_is_not_treated_as_a_broken_judge():
+    # A refusal has no claims to be unfaithful about; None there is ordinary.
+    rows = [dict.fromkeys(answers._JUDGED_METRICS), {**dict.fromkeys(answers._JUDGED_METRICS), "faithfulness": 1.0}]
+    assert not answers._judge_produced_nothing(rows)
 
 
 def test_faithfulness_is_the_supported_fraction():

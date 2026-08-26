@@ -39,29 +39,93 @@ and `check_judge_independence` refuses to let the two collapse again in silence.
 import json
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
-_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+_THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK = re.compile(r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """
+    Remove inline chain-of-thought from a judge reply.
+
+    Not every model puts its reasoning in the same place. The `gpt-oss` models on
+    Groq return it out of band, in a separate `reasoning` field, so `.content` is
+    clean JSON and nothing here was ever needed. Qwen inlines it in the content as
+    a `<think>` block. Moving the judge to a different family to stop it grading its
+    own homework therefore changed the *shape* of the judge reply, and the parser
+    was written against the old shape.
+
+    That mattered more than a mangled string, because the reasoning is where the
+    model restates the JSON schema it was asked for. So the block contains braces,
+    and the old greedy `{.*}` match ran from a brace inside the reasoning to the
+    last brace of the real answer, producing something that could never parse.
+
+    An unclosed `<think>` means generation was cut off before the answer, so there
+    is nothing to salvage; dropping the tail lets the caller report a parse failure
+    rather than parse the model's deliberations as its verdict.
+    """
+    text = _THINK_BLOCK.sub("", text or "")
+    text = _UNCLOSED_THINK.sub("", text)
+    return text.strip()
+
+
+def _json_objects(text: str) -> Iterator[str]:
+    """
+    Yield balanced `{...}` spans, last first.
+
+    Balanced rather than regex: a greedy match spans unrelated objects and a lazy
+    one stops at the first nested closing brace. Last first because prose that
+    surrounds a JSON reply is far more often a preamble than a postscript.
+    """
+    starts: List[int] = []
+    spans: List[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            starts.append(index)
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            start = starts.pop()
+            if depth == 0:
+                spans.append(text[start : index + 1])
+    return reversed(spans)
 
 
 def parse_json_object(text: str) -> Dict:
     """
     Pull a JSON object out of a model response.
 
-    Models wrap JSON in prose or fences no matter how firmly the prompt says not
-    to, so extract the outermost braces rather than trusting the whole string.
-    Raises ValueError if there is nothing parseable — a silent {} would show up as
-    a score of zero and look like a bad answer instead of a bad parse.
+    Models wrap JSON in prose, fences or reasoning no matter how firmly the prompt
+    says not to. Raises ValueError if there is nothing parseable — a silent {} would
+    show up as a score of zero and look like a bad answer instead of a bad parse.
     """
-    text = text.strip()
+    text = strip_reasoning(text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    match = _JSON_BLOCK.search(text)
-    if not match:
-        raise ValueError(f"No JSON object in judge response: {text[:200]!r}")
-    return json.loads(match.group(0))
+    for candidate in _json_objects(text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError(f"No JSON object in judge response: {text[:200]!r}")
 
 
 CLAIM_EXTRACTION_PROMPT = """\
