@@ -29,12 +29,27 @@ from evals.judges import (
 from evals.metrics import provision_rank
 
 
+# Enough for the reasoning plus the JSON after it. Verified against the
+# claim-extraction prompt, the longest of the three: the default budget truncates
+# mid-thought, 4096 closes the block and leaves parseable JSON.
+JUDGE_MAX_TOKENS = 4096
+
+
 def _make_judge_callable(judge_model: str):
     from langchain_core.messages import HumanMessage
     from langchain_groq import ChatGroq
 
     # Temperature 0: the judge should give the same verdict on a rerun.
-    llm = ChatGroq(model=judge_model, temperature=0)
+    #
+    # max_tokens is explicit because the judge inlines its reasoning. The `gpt-oss`
+    # models this harness used to judge with return reasoning out of band, so the
+    # default budget only ever had to cover the JSON. Qwen spends the same budget
+    # thinking first, and on the claim-extraction prompt - which asks it to
+    # enumerate every claim, so it enumerates them once while reasoning and again
+    # in the answer - the default cut generation off mid-thought. The reply then
+    # had an unclosed `<think>`, `strip_reasoning` correctly threw the tail away,
+    # and the caller recorded "no claims" for an answer full of them.
+    llm = ChatGroq(model=judge_model, temperature=0, max_tokens=JUDGE_MAX_TOKENS)
 
     def call(prompt: str) -> str:
         # Through the retry policy, not straight at the API: a judge is as exposed to
@@ -180,6 +195,17 @@ def run(
             json.dump(rows, handle, indent=2, ensure_ascii=False)
         print(f"\nWrote {json_path}")
 
+    thin = _thinly_scored_metrics(rows)
+    if rows and thin and not _judge_produced_nothing(rows):
+        listed = ", ".join(f"{m} ({n}/{len(rows)})" for m, n in thin)
+        print(
+            f"\nScored on too few questions to publish: {listed}. A mean over a "
+            "handful of questions is not the score for the set, and printing it "
+            "beside metrics that did score every question invites reading it as "
+            "one. The rest of this run is fine; these numbers are not."
+        )
+        return 4
+
     if rows and _judge_produced_nothing(rows):
         print(
             "\nEvery judged metric came back empty across all "
@@ -213,6 +239,30 @@ def _judge_produced_nothing(rows: List[Dict]) -> bool:
     return all(row.get(metric) is None for row in rows for metric in _JUDGED_METRICS)
 
 
+# Below this share of questions, a judged mean stops describing the set. Set
+# loosely on purpose: `faithfulness` is legitimately None when an answer makes no
+# claims, so a few Nones are ordinary and only a collapse should trip this.
+_MIN_COVERAGE = 0.5
+
+
+def _thinly_scored_metrics(rows: List[Dict]) -> List[tuple]:
+    """
+    Judged metrics scored on too small a fraction of the run to report.
+
+    The all-empty case has its own check and its own message. This one catches the
+    shape that is harder to see and was actually shipped: one metric collapses,
+    the other three score every question, and the table prints a mean over two
+    answers in the same column as a mean over twenty-five. Nothing in the output
+    says which is which, so the failure reads as a result.
+    """
+    thin = []
+    for metric in _JUDGED_METRICS:
+        scored = sum(1 for row in rows if row.get(metric) is not None)
+        if 0 <= scored < _MIN_COVERAGE * len(rows):
+            thin.append((metric, scored))
+    return thin
+
+
 def _fmt(value: Optional[float]) -> str:
     return " n/a" if value is None else f"{value:.2f}"
 
@@ -225,17 +275,25 @@ def _summarise(rows: List[Dict]) -> None:
     if failed:
         print(f"Agent failures: {failed}/{len(rows)}")
 
-    print("\n| Metric | Score |")
-    print("|---|---:|")
-    print(f"| Grounded retrieval | {grounded}/{len(rows)} |")
+    print("\n| Metric | Score | Scored |")
+    print("|---|---:|---:|")
+    print(f"| Grounded retrieval | {grounded}/{len(rows)} | {len(rows)}/{len(rows)} |")
     for key, label in [
         ("faithfulness", "Faithfulness"),
         ("answer_relevancy", "Answer relevancy"),
         ("answer_correctness", "Answer correctness"),
         ("context_precision", "Context precision"),
     ]:
-        value = mean([r[key] for r in rows])
-        print(f"| {label} | {'n/a' if value is None else f'{value:.2f}'} |")
+        values = [r[key] for r in rows]
+        value = mean(values)
+        scored = sum(1 for v in values if v is not None)
+        # Coverage is printed beside the mean, always. A mean over the two
+        # questions the judge managed to score reads exactly like a mean over all
+        # twenty-five, and that is how a judge failure gets published as a result.
+        print(
+            f"| {label} | {'n/a' if value is None else f'{value:.2f}'} "
+            f"| {scored}/{len(rows)} |"
+        )
 
     weak = [r for r in rows if (r["answer_correctness"] or 1.0) < 0.7 or not r["grounded"]]
     if weak:

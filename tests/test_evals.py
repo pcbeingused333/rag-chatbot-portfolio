@@ -264,6 +264,81 @@ def test_one_unscored_question_is_not_treated_as_a_broken_judge():
     assert not answers._judge_produced_nothing(rows)
 
 
+def test_a_metric_scored_on_a_handful_of_questions_is_not_publishable():
+    # The shape that shipped on 28-Aug: the judge ran out of tokens mid-thought on
+    # the claim-extraction prompt, so `faithfulness` scored 2 of 25 while the other
+    # three scored all 25. The table printed "Faithfulness 1.00" - a mean over two
+    # answers - in the same column as means over twenty-five.
+    rows = [
+        {**dict.fromkeys(answers._JUDGED_METRICS, 1.0), "faithfulness": None}
+        for _ in range(25)
+    ]
+    rows[0]["faithfulness"] = 1.0
+    rows[1]["faithfulness"] = 1.0
+
+    thin = answers._thinly_scored_metrics(rows)
+
+    assert [m for m, _ in thin] == ["faithfulness"]
+    assert thin[0][1] == 2
+    # Not the all-empty case: that has its own message, and this one hid behind it.
+    assert not answers._judge_produced_nothing(rows)
+
+
+def test_a_few_unscored_questions_do_not_trip_the_coverage_guard():
+    # None is ordinary when an answer makes no claims. Only a collapse should trip.
+    rows = [dict.fromkeys(answers._JUDGED_METRICS, 1.0) for _ in range(10)]
+    rows[0]["faithfulness"] = None
+    rows[1]["faithfulness"] = None
+
+    assert answers._thinly_scored_metrics(rows) == []
+
+
+def test_the_summary_says_how_many_questions_each_metric_scored(capsys):
+    rows = [
+        {
+            **dict.fromkeys(answers._JUDGED_METRICS, 1.0),
+            "faithfulness": 1.0 if i < 2 else None,
+            "grounded": True,
+            "error": None,
+            "id": f"q{i}",
+            "lang": "en",
+            "note": "",
+            "answer": "",
+        }
+        for i in range(25)
+    ]
+
+    answers._summarise(rows)
+
+    table = capsys.readouterr().out
+    # The count has to travel with the mean, or the mean is read as the set's.
+    assert "2/25" in table
+    assert "Scored" in table
+
+
+def test_the_judge_is_given_room_to_finish_its_reasoning(monkeypatch):
+    # A judge that inlines reasoning spends the token budget thinking before it
+    # answers. On the default budget generation was cut off mid-thought, the reply
+    # had an unclosed `<think>`, and the caller recorded "no claims" for an answer
+    # that was full of them.
+    captured = {}
+
+    class FakeChatGroq:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def invoke(self, _messages):
+            raise AssertionError("not called")
+
+    import langchain_groq
+
+    monkeypatch.setattr(langchain_groq, "ChatGroq", FakeChatGroq)
+    answers._make_judge_callable("qwen/qwen3.6-27b")
+
+    assert captured["max_tokens"] == answers.JUDGE_MAX_TOKENS
+    assert answers.JUDGE_MAX_TOKENS >= 4096
+
+
 def test_faithfulness_is_the_supported_fraction():
     verdicts = [{"supported": True}, {"supported": False}, {"supported": True}]
     assert judges.faithfulness_from_verdicts(verdicts) == pytest.approx(2 / 3)
