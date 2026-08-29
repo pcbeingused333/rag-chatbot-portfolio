@@ -337,6 +337,10 @@ def test_the_judge_is_given_room_to_finish_its_reasoning(monkeypatch):
 
     assert captured["max_tokens"] == answers.JUDGE_MAX_TOKENS
     assert answers.JUDGE_MAX_TOKENS >= 4096
+    # The budget alone was not enough: on the longer answers the judge still spent
+    # all of it reasoning, so only the shortest questions reached their JSON. The
+    # extraction it is asked for does not need deliberation.
+    assert captured["reasoning_effort"] == "none"
 
 
 def test_faithfulness_is_the_supported_fraction():

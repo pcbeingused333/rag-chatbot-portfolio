@@ -49,7 +49,18 @@ def _make_judge_callable(judge_model: str):
     # in the answer - the default cut generation off mid-thought. The reply then
     # had an unclosed `<think>`, `strip_reasoning` correctly threw the tail away,
     # and the caller recorded "no claims" for an answer full of them.
-    llm = ChatGroq(model=judge_model, temperature=0, max_tokens=JUDGE_MAX_TOKENS)
+    # reasoning_effort="none" is the fix that matters. Raising max_tokens alone was
+    # not enough: the judge still spent the whole budget thinking on the longer
+    # answers, and only the shortest ones ever reached their JSON. It also made the
+    # daily budget run out at question 7 instead of 25. Asking this judge not to
+    # reason at all removes both - the claim extraction it was asked for does not
+    # need deliberation, and the schema is fixed.
+    llm = ChatGroq(
+        model=judge_model,
+        temperature=0,
+        max_tokens=JUDGE_MAX_TOKENS,
+        reasoning_effort="none",
+    )
 
     def call(prompt: str) -> str:
         # Through the retry policy, not straight at the API: a judge is as exposed to
