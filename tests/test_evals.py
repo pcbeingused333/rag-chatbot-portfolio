@@ -5,6 +5,8 @@ An eval that is wrong is worse than no eval: it produces numbers that look
 authoritative and are not. Everything scoreable without a network call is tested
 here — the substring matching, the aggregates, the judge parsing.
 """
+import os
+
 import pytest
 
 from evals import abstention, answers, judges
@@ -657,3 +659,91 @@ def test_an_ordinary_agent_failure_is_still_scored_as_a_miss():
     result = answers._answer(FlakyAgent(), QUESTIONS[0])
     assert result["answer"] == ""
     assert "RuntimeError" in result["error"]
+
+
+# ---- the judge, against the real model ----
+#
+# Everything above this line runs offline. This one does not, and it exists
+# because of a question the offline tests cannot answer.
+#
+# On 2026-08-31 a clean run scored `answer_relevancy` and `answer_correctness`
+# at exactly 1.00 on all 25 questions, while `faithfulness` and
+# `context_precision` — one of them from the *same* judge call — varied. A
+# metric that never moves is indistinguishable from a metric that is not
+# measuring, and no amount of parsing tests can tell the two apart: the parser
+# is working perfectly in both cases.
+#
+# The only thing that separates them is a negative control. Hand the judge an
+# answer that is definitely wrong and see whether the number drops. It did, so
+# the 1.00s were real. This test pins that, so the next person to see a
+# saturated column can rule out the boring explanation in one command instead
+# of reasoning about it.
+
+# Opt-in by a variable of its own, deliberately NOT the API key. `rag_core`
+# calls load_dotenv() on import, so GROQ_API_KEY is in the environment for any
+# test that imports the chain — gating on it meant these ran on every plain
+# `pytest`, spending the daily token budget that a full eval run needs. The
+# quota is the scarcest resource in this project; the suite must never touch it
+# by accident.
+pytestmark_network = pytest.mark.skipif(
+    os.environ.get("EVAL_LIVE_JUDGE") != "1",
+    reason="live-judge control; run with EVAL_LIVE_JUDGE=1 (spends daily quota)",
+)
+
+
+@pytestmark_network
+def test_the_judge_still_penalises_an_answer_that_contradicts_a_figure():
+    """A judge that scores a wrong answer 1.0 is a judge that is not reading."""
+    from evals.answers import _make_judge_callable
+    from evals.judges import DEFAULT_JUDGE_MODEL, judge
+
+    call = _make_judge_callable(DEFAULT_JUDGE_MODEL)
+    question = (
+        "Within what deadline must a personal data breach be notified to the "
+        "supervisory authority?"
+    )
+    reference = (
+        "Without undue delay and, where feasible, not later than 72 hours after "
+        "becoming aware of it (Art. 33(1))."
+    )
+    contexts = [
+        "Art. 33(1): In the case of a personal data breach, the controller shall "
+        "without undue delay and, where feasible, not later than 72 hours after "
+        "having become aware of it, notify the personal data breach to the "
+        "supervisory authority."
+    ]
+
+    right = judge(call, question, "No later than 72 hours after becoming aware.",
+                  reference, contexts)
+    wrong = judge(call, question, "Within 30 days of becoming aware.",
+                  reference, contexts)
+
+    assert right.answer_correctness == pytest.approx(1.0)
+    assert wrong.answer_correctness < 0.5, (
+        "The judge gave full marks to an answer that contradicts the figure in "
+        "the reference. Every answer_correctness number in the published table "
+        "is meaningless until this passes."
+    )
+    # Relevancy is *supposed* to stay high here: the prompt asks it to judge
+    # whether the answer addresses the question, explicitly not whether it is
+    # true. Asserting it keeps the two metrics from quietly collapsing into one.
+    assert wrong.answer_relevancy == pytest.approx(1.0)
+
+
+@pytestmark_network
+def test_the_judge_marks_an_off_topic_answer_irrelevant():
+    """The other half of the control: relevancy has to move as well."""
+    from evals.answers import _make_judge_callable
+    from evals.judges import DEFAULT_JUDGE_MODEL, judge
+
+    call = _make_judge_callable(DEFAULT_JUDGE_MODEL)
+    scores = judge(
+        call,
+        "Within what deadline must a personal data breach be notified?",
+        "The controller must appoint a data protection officer when it processes "
+        "data at scale.",
+        "Not later than 72 hours after becoming aware of it (Art. 33(1)).",
+        ["Art. 33(1): ... not later than 72 hours after having become aware of it."],
+    )
+    assert scores.answer_relevancy < 0.5
+    assert scores.answer_correctness < 0.5

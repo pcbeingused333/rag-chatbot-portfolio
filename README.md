@@ -226,7 +226,9 @@ Spanish set is too small to distinguish from noise. It is one question.
 ### Refusing what the corpus does not contain
 
 `python -m evals.run_eval abstention` — 7 questions the Regulation does not answer,
-each adjacent enough that the model has certainly read about it.
+each adjacent enough that the model has certainly read about it. Re-run 2026-09-01 and
+judged by `qwen/qwen3.6-27b`; the version of this table published on 25 August had been
+scored by the model under test and is superseded.
 
 | Outcome | |
 |---|---:|
@@ -346,53 +348,98 @@ under test had been sharing one allowance, which is why the 25-question run kept
 half-way. With the judge drawing on its own, roughly three quarters of the cost moves
 off the critical budget.
 
-### Not yet re-measured against this corpus
+### Answer quality, end to end
 
-One command is left. `answers` scores end-to-end quality against all 25 legal
-questions and it is **not quoted in this README**, because the only numbers it has
-were taken against the previous corpus and a different system prompt. Carrying them
-forward would be the exact mistake the heading experiment above exists to warn about.
+`python -m evals.run_eval answers` — all 25 legal questions, answered by the agent and
+scored by an independent judge. Run 2026-09-01, `openai/gpt-oss-120b` under test,
+`qwen/qwen3.6-27b` judging.
 
-What it needs is a day, not a fix. At roughly four calls a question — one agent turn
-and three judge calls — a full pass used to cost about the whole 200,000-token daily
-allowance of Groq's free tier, because the judge and the system under test spent the
-same one. Two attempts died half-way: the first at question 7 with a traceback, the
-second at question 11, and the last one at question 1, on a budget already spent by
-the runs above. The partial-run handling and the independent judge are what those
-failures bought.
+| Metric | Score | Scored |
+|---|---:|---:|
+| Grounded retrieval | **24/25** | 25/25 |
+| Faithfulness | **0.97** | 25/25 |
+| Answer relevancy | 1.00 | 25/25 |
+| Answer correctness | 1.00 | 25/25 |
+| Context precision | 0.28 | 25/25 |
 
-Now that the judge draws on a separate model's allowance, only the agent turns come
-out of the shipped model's budget — roughly a quarter of the previous cost, which
-fits a full pass comfortably. It still has to finish in one run: merging a partial
-into an older one is how a mean stops meaning anything, which is why no number from
-any of those attempts is quoted here. The abstention table above is queued behind the
-same fresh budget, to be re-judged by the independent judge.
+The `Scored` column is not decoration. An earlier run of this table printed
+`Faithfulness 1.00` and exited zero over an average of **2 of 25** questions, and
+nothing on the page said so. Coverage is now printed beside every mean and a metric
+scored on less than half the run exits non-zero.
 
-**The re-judge was attempted on 26 August and produced nothing, for a new reason.**
-Moving the judge to a different family to stop the shipped model grading its own
-answers also changed the *shape* of a judge reply, and nothing checked that. The
-`gpt-oss` models on Groq return their reasoning out of band, in a separate field, so
-the message content was clean JSON; Qwen inlines it as a `<think>` block. The
-reasoning is where a model restates the schema it was asked for, so it contains
-braces, and the parser's greedy `{.*}` ran from a brace inside the reasoning to the
-last brace of the real answer — a span that could never parse.
+Context precision at 0.28 is the honest number here: the retriever returns four
+passages and typically one or two carry the answer, so three quarters of what reaches
+the model is on-topic ballast. That is the cost of a small top-k over provisions that
+share vocabulary, and it is the number reranking would move.
 
-What that looked like is the part worth keeping: every abstention verdict came back
-`unparsed`, so the run reported **0/6 abstained** while the agent had in fact abstained
-correctly on every question. And the `answers` run printed a full table of `n/a` under
-a zero exit status, which reads as a completed run rather than a failed one. A judged
-metric coming back empty for one question is ordinary — a refusal has no claims to be
-unfaithful about. Every metric empty on every question is the judge being unreadable,
-and it now exits non-zero and says so.
+#### Two of those columns are 1.00 on every question, so they were tested
 
-Fixed: `strip_reasoning` removes the block, JSON extraction is brace-balanced rather
-than greedy and reads the last object rather than the first, and `abstention` shares
-that one parser instead of keeping a second regex — the duplicate is the whole reason
-the change had to be noticed twice and was noticed nowhere. Eight regression tests,
-six of which fail with the fix reverted; the other two pin the new scanner's own
-failure modes and say so in the file. Neither run's numbers are quoted here: the
-`answers` judged metrics measured nothing, and the abstention pass stopped at 6 of 7
-on a spent daily budget.
+`answer_relevancy` and `answer_correctness` came back at exactly 1.00 on all 25, while
+`faithfulness` varied (0.75 / 0.88 / 1.00) and `context_precision` varied (0.25 / 0.50)
+— one of them from the *same* judge call. A metric that never moves is
+indistinguishable from a metric that is not measuring, and no parsing test separates
+them, because the parser is working perfectly in both cases.
+
+The only thing that separates them is a negative control: hand the judge answers that
+are definitely wrong and see whether the number drops.
+
+| Answer given to a question whose reference says *"72 hours"* | relevancy | correctness |
+|---|---:|---:|
+| No later than 72 hours after becoming aware | 1.00 | 1.00 |
+| Within **30 days** of becoming aware | 1.00 | **0.00** |
+| There is **no obligation** to notify | 1.00 | **0.00** |
+| The controller must appoint a data protection officer | **0.00** | 0.00 |
+| *I don't know* | **0.00** | 0.00 |
+
+The judge reads. It penalises a contradicted figure and an inverted yes/no, it drops
+relevancy for an answer about something else, and it holds relevancy high for a
+confidently wrong answer to the right question — which is what the prompt asks it to
+do, and the reason the two metrics are separate in the first place. So the 1.00s are
+real: on this set the system answers relevantly and correctly, and those two columns
+currently confirm rather than discriminate. The signal lives in faithfulness and
+context precision.
+
+That control is now two tests rather than a memory, behind `EVAL_LIVE_JUDGE=1` so a
+plain `pytest` never spends the daily budget. The gate is a variable of its own and
+deliberately not the API key: `rag_core` calls `load_dotenv()` on import, so keying the
+skip on `GROQ_API_KEY` meant the tests ran on every ordinary test run and quietly spent
+the quota a full eval pass needs — a check that was not checking, which is the same
+shape as everything else on this page.
+
+### What it took to get one clean run
+
+The numbers above are the first complete pass since the corpus was rebuilt, and the
+six-week gap was not a modelling problem.
+
+At roughly four calls a question, a full pass used to cost about the whole 200,000-token
+daily allowance of Groq's free tier, because the judge and the system under test drew on
+the same one. Moving the judge to a different family fixed the methodology *and* the
+budget — only agent turns now come out of the shipped model's allowance — but it changed
+the shape of a judge reply, and nothing checked that. The `gpt-oss` models return their
+reasoning out of band, so the content was clean JSON; Qwen inlines it in a `<think>`
+block, and reasoning is where a model restates the schema it was asked for, so it
+contains braces. The parser's greedy `{.*}` ran from a brace inside the reasoning to the
+last brace of the real answer: a span that could never parse.
+
+What that looked like is the part worth keeping. Every abstention verdict came back
+`unparsed`, so a run reported **0/6 abstained** while the agent had abstained correctly
+on all six. And an `answers` run printed a full table of `n/a` under a zero exit status,
+which reads as a completed run rather than a failed one. One judged metric coming back
+empty is ordinary — a refusal has no claims to be unfaithful about. Every metric empty on
+every question is the judge being unreadable.
+
+Then the judge ran out of room. It spent its whole budget reasoning before emitting the
+JSON, so the output was cut off, the parser correctly recorded *no claims*, and no-claims
+is indistinguishable from a legitimate abstention — which is how a mean over 2 of 25
+questions printed as 1.00 and exited zero. Raising `max_tokens` tripled the cost and did
+not fix it; `reasoning_effort="none"` did, because claim extraction against a fixed
+schema does not need deliberation.
+
+Six defects, all in the harness rather than the system it measures, and every one of them
+looked like a clean run. The guardrails they bought — coverage beside every mean, a
+non-zero exit under half coverage, a refusal to start when judge and subject match, a
+daily budget that raises instead of retrying, and now a live negative control — are the
+reason these numbers are quoted and the earlier ones are not.
 
 ## 🧱 Tech Stack
 
