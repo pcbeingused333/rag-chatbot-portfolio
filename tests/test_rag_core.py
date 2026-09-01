@@ -284,3 +284,100 @@ def test_batch_ingestion_is_refused_in_demo_mode(monkeypatch):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "DEMO_MODE" in str(e)
+
+
+# ---- a retired model must not take the demo down with it ----
+#
+# Both public demos pin the same Groq model, so a retirement breaks them together
+# and the discovery path is a recruiter opening a dead link. This happened once
+# already at a smaller scale: `llama-3.3-70b-versatile` was retired mid-project and
+# the tool-call probe reported it as a 100% failure rate, because every request was
+# going to a model that no longer existed.
+
+def test_a_configured_model_that_is_still_served_is_used_unchanged(monkeypatch):
+    monkeypatch.setattr(rag_core, "_resolved_model", None)
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+    monkeypatch.setattr(
+        rag_core, "available_models",
+        lambda *a, **k: {"openai/gpt-oss-120b", "openai/gpt-oss-20b"},
+    )
+    assert rag_core.resolve_llm_model() == "openai/gpt-oss-120b"
+
+
+def test_a_retired_model_falls_back_to_the_first_available_candidate(monkeypatch, capsys):
+    monkeypatch.setattr(rag_core, "_resolved_model", None)
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+    # The shipped model is gone; so is the first fallback.
+    monkeypatch.setattr(
+        rag_core, "available_models",
+        lambda *a, **k: {"qwen/qwen3.8-27b", "whisper-large-v3"},
+    )
+
+    assert rag_core.resolve_llm_model() == "qwen/qwen3.8-27b"
+
+    warning = capsys.readouterr().err
+    assert "no longer in Groq's catalogue" in warning
+    # The substitution has to say that the published numbers no longer describe the
+    # running system. A silent swap is how a table ends up reporting a model nobody
+    # is calling.
+    assert "do not describe this model" in warning
+
+
+def test_an_unreadable_catalogue_leaves_the_configured_model_alone(monkeypatch, capsys):
+    """Fail open. A checker that breaks must not break the thing it checks."""
+    monkeypatch.setattr(rag_core, "_resolved_model", None)
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+    monkeypatch.setattr(rag_core, "available_models", lambda *a, **k: None)
+
+    assert rag_core.resolve_llm_model() == "openai/gpt-oss-120b"
+    assert capsys.readouterr().err == ""
+
+
+def test_an_empty_catalogue_is_not_treated_as_every_model_being_gone(monkeypatch):
+    """None and an empty set are different answers and must not collapse."""
+    monkeypatch.setattr(rag_core, "_resolved_model", None)
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+    monkeypatch.setattr(rag_core, "available_models", lambda *a, **k: set())
+
+    # Nothing to fall back to, so the provider's own error is the honest outcome.
+    assert rag_core.resolve_llm_model() == "openai/gpt-oss-120b"
+
+
+def test_the_catalogue_is_read_once_per_process(monkeypatch):
+    """The demo already takes twelve seconds to wake up; don't add a call per turn."""
+    monkeypatch.setattr(rag_core, "_resolved_model", None)
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+    calls = []
+
+    def counting(*_a, **_k):
+        calls.append(1)
+        return {"openai/gpt-oss-120b"}
+
+    monkeypatch.setattr(rag_core, "available_models", counting)
+    rag_core.resolve_llm_model()
+    rag_core.resolve_llm_model()
+    rag_core.resolve_llm_model()
+    assert len(calls) == 1
+
+    rag_core.resolve_llm_model(recheck=True)
+    assert len(calls) == 2
+
+
+def test_available_models_returns_none_without_a_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    assert rag_core.available_models() is None
+
+
+def test_the_fallback_chain_holds_no_model_that_cannot_do_the_job(monkeypatch):
+    """`groq/compound*` are agentic systems and allam-2-7b has a 4k context.
+
+    Neither can stand in for a chat model reading four GDPR passages, and a chain
+    that quietly includes one turns an outage into a wrong answer.
+    """
+    assert rag_core.DEFAULT_LLM_MODEL not in rag_core.FALLBACK_LLM_MODELS
+    for model in rag_core.FALLBACK_LLM_MODELS:
+        assert not model.startswith("groq/compound")
+        assert "allam" not in model
+        assert "whisper" not in model
+        assert "orpheus" not in model
+        assert "guard" not in model

@@ -16,7 +16,9 @@ Heavy dependencies (sentence-transformers/torch, the Postgres driver, the PDF
 loaders) are imported lazily inside the functions that need them, so importing this
 module — and the unit tests — stay fast and dependency-light.
 """
+import json
 import os
+import sys
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -510,9 +512,88 @@ CROSS_LINGUAL_RULE = (
 )
 
 
-def resolve_llm_model() -> str:
-    """The chat model for the current environment; an explicit env var always wins."""
-    return os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL)
+# Both public demos — this one and the MCP agent — pin the same model, so a
+# retirement takes them down together, and the way you find out is a recruiter
+# opening a broken link. It is not hypothetical: `llama-3.3-70b-versatile` was
+# retired mid-project and the tool-call probe reported it as "100% failures" for a
+# while, because every request was going to a model that no longer existed.
+#
+# The chain is ordered by how close each one is to the shipped model's behaviour:
+# its own smaller sibling first, then a different family. `groq/compound*` are
+# agentic systems rather than chat models and `allam-2-7b` has a 4k context that
+# cannot hold four GDPR passages, so neither belongs here.
+FALLBACK_LLM_MODELS = ("openai/gpt-oss-20b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b")
+
+_resolved_model: Optional[str] = None
+
+
+def available_models(timeout: float = 8.0) -> Optional[set]:
+    """The ids Groq is currently serving, or None if the catalogue can't be read.
+
+    None is not an empty set, and the difference matters: an unreachable catalogue
+    must never look like "every model is gone".
+    """
+    import urllib.request
+
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    try:
+        request = urllib.request.Request(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+        return {m["id"] for m in payload.get("data", [])}
+    except Exception:  # noqa: BLE001 — see fail-open note in resolve_llm_model
+        return None
+
+
+def resolve_llm_model(recheck: bool = False) -> str:
+    """The chat model for the current environment; an explicit env var always wins.
+
+    Checked once per process against Groq's catalogue, because a pinned model that
+    has been retired fails on every request and the demo is the thing people click
+    from a job application.
+
+    Two deliberate choices. It **fails open**: if the catalogue cannot be read — no
+    key, no network, a bad day at the provider — the configured model is returned
+    unchanged, because a checker that takes the app down when the *checker* breaks is
+    worse than the problem it guards. And it is loud when it substitutes: silently
+    answering on a different model than the one the README names is how the
+    tool-call table ended up reporting numbers for a model nobody was calling.
+    """
+    global _resolved_model
+
+    configured = os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL)
+    if _resolved_model is not None and not recheck:
+        return _resolved_model
+
+    catalogue = available_models()
+    if catalogue is None or configured in catalogue:
+        _resolved_model = configured
+        return configured
+
+    for candidate in FALLBACK_LLM_MODELS:
+        if candidate in catalogue:
+            print(
+                f"WARNING: `{configured}` is no longer in Groq's catalogue. "
+                f"Falling back to `{candidate}`. The published evaluation numbers "
+                f"were measured on `{configured}` and do not describe this model.",
+                file=sys.stderr,
+            )
+            _resolved_model = candidate
+            return candidate
+
+    print(
+        f"WARNING: `{configured}` is gone and none of {FALLBACK_LLM_MODELS} is "
+        "available either. Continuing with the configured model so the failure is "
+        "the provider's error rather than a silent substitution.",
+        file=sys.stderr,
+    )
+    _resolved_model = configured
+    return configured
 
 
 def build_system_prompt(demo_mode: Optional[bool] = None) -> str:
